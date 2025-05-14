@@ -26,7 +26,6 @@ setuptools.setup(
     python_requires='>=3.7',
     install_requires=[
         "websockets>=10.0", # For WebSocket communication
-        "asyncio>=3.4.3",
     ],
     keywords=[
         "vitrus", "actors", "agents", "workflows", "robotics", "ai", 

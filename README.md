@@ -6,7 +6,9 @@ For detailed documentation and more examples access [Vitrus Docs](https://vitrus
 ## Installation
 
 ```bash
-pip install vitrus
+git clone https://github.com/vitrus-ai/vitrus-sdk-python.git
+cd vitrus-sdk-python
+pip install -e .
 ```
 
 ## Authentication
