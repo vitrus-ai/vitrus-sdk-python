@@ -3,8 +3,14 @@
 A Python client for multi Agent-World-Actor orchestration, with easy-to-use spatial perception Workflows.
 For detailed documentation and more examples access [Vitrus Docs](https://vitrus.gitbook.io/docs/concepts).
 
-## Installation
+We also provide a [Typescript SDK](https://github.com/vitrus-ai/vitrus-sdk-python#).
 
+## Installation
+```bash
+pip install git+https://github.com/vitrus-ai/vitrus-sdk-python.git
+```
+
+Or by cloning the repo
 ```bash
 git clone https://github.com/vitrus-ai/vitrus-sdk-python.git
 cd vitrus-sdk-python
