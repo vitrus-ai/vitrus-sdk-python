@@ -12,6 +12,10 @@ import logging
 import random
 import string
 import uuid
+import signal
+import atexit
+import threading
+import weakref
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import websockets
@@ -23,6 +27,52 @@ DEFAULT_BASE_URL = 'wss://vitrus-dao.onrender.com'
 # Configure logging
 logger = logging.getLogger("vitrus")
 
+# Track all Vitrus instances for global cleanup
+_vitrus_instances = weakref.WeakSet()
+
+# Flag to track if signal handlers are set up
+_signal_handlers_installed = False
+
+# Function to handle cleanup on exit
+def _global_cleanup():
+    """Clean up all Vitrus instances on program exit"""
+    loop = None
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        # Create a new event loop if none exists
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    if loop and not loop.is_closed():
+        for instance in list(_vitrus_instances):
+            if hasattr(instance, '_cleanup') and callable(instance._cleanup):
+                try:
+                    loop.run_until_complete(instance._cleanup())
+                except Exception as e:
+                    logger.debug(f"Error during Vitrus instance cleanup: {e}")
+
+# Register cleanup with atexit
+atexit.register(_global_cleanup)
+
+# Signal handler for graceful shutdown
+def _signal_handler(sig, frame):
+    """Handle termination signals by cleaning up all Vitrus instances"""
+    logger.debug(f"Received signal {sig}, initiating Vitrus SDK cleanup")
+    _global_cleanup()
+    
+# Install signal handlers
+def _install_signal_handlers():
+    """Install signal handlers if not already done"""
+    global _signal_handlers_installed
+    if not _signal_handlers_installed:
+        try:
+            signal.signal(signal.SIGINT, _signal_handler)
+            signal.signal(signal.SIGTERM, _signal_handler)
+            _signal_handlers_installed = True
+        except (ValueError, AttributeError):
+            # This happens when not in the main thread
+            pass
 
 class Scene:
     """Scene class for managing scene objects"""
@@ -65,26 +115,41 @@ class Actor:
         self.name = name
         self.metadata = metadata or {}
         self.command_handlers = {}
+        
+    def __del__(self):
+        """Destructor to ensure cleanup"""
+        try:
+            # We can't use async in __del__, so just remove from tracking
+            if hasattr(self, 'vitrus') and hasattr(self.vitrus, 'created_actors'):
+                self.vitrus.created_actors.discard(self)
+        except Exception:
+            # Never raise exceptions in __del__
+            pass
 
     def on(self, command_name: str, handler: Callable) -> 'Actor':
         """Register a command handler"""
         self.command_handlers[command_name] = handler
-
+        
         # Extract parameter types
         parameter_types = self._get_parameter_types(handler)
-
+        
         # Register with Vitrus (local handler map)
         self.vitrus.register_actor_command_handler(
             self.name, command_name, handler, parameter_types)
-
+        
         # Register command with server *only if* currently connected as this actor
         if self.vitrus.is_authenticated and self.vitrus.actor_name == self.name:
+            # For debugging
+            if self.vitrus.debug:
+                logger.debug(f"Registering command {command_name} with the server for actor {self.name}")
+            
+            # Create a task but don't await it to avoid blocking
             asyncio.create_task(self.vitrus.register_command(
                 self.name, command_name, parameter_types))
         elif self.vitrus.debug:
             logger.debug(
                 f"Not sending REGISTER_COMMAND for {command_name} on {self.name} as SDK is not authenticated as this actor.")
-
+        
         return self
 
     async def run(self, command_name: str, *args) -> Any:
@@ -100,9 +165,13 @@ class Actor:
         self.metadata.update(new_metadata)
         # TODO: Send metadata update to server
 
-    def disconnect(self) -> None:
-        """Disconnect the actor if the SDK is currently connected as this actor."""
+    async def disconnect(self) -> None:
+        """Disconnect the actor asynchronously if the SDK is currently connected as this actor."""
+        # Call the SDK disconnection method for this actor
         self.vitrus.disconnect_if_actor(self.name)
+        
+        # If we need to do a full async disconnection with the SDK
+        await self.vitrus.disconnect()
 
     def _get_parameter_types(self, func: Callable) -> List[str]:
         """Extract parameter types from function signature"""
@@ -143,11 +212,18 @@ class Vitrus:
         self.actor_command_signatures = {}
         self.actor_metadata = {}
         self.connection_task = None
+        self.created_actors = set()  # Track all actors created by this instance
 
         if self.debug:
             logger.setLevel(logging.DEBUG)
             logger.debug(
                 f"Vitrus v{SDK_VERSION} initializing with options: {{'apiKey': '***', 'world': {world}, 'baseUrl': {base_url}, 'debug': {debug}}}")
+
+        # Add this instance to the global set for cleanup
+        _vitrus_instances.add(self)
+        
+        # Install signal handlers
+        _install_signal_handlers()
 
     async def connect(self, actor_name: str = None, metadata: Dict[str, Any] = None) -> None:
         """Connect to the WebSocket server with authentication"""
@@ -436,30 +512,62 @@ class Vitrus:
         request_id = message.get("requestId")
         target_actor_name = message.get("targetActorName")
         source_channel = message.get("sourceChannel")
-
+        
         if self.debug:
             logger.debug(
-                f"Handling command: {command_name} for actor {target_actor_name}, requestId: {request_id}")
-
+                f"Handling command: {command_name} for actor {target_actor_name}, requestId: {request_id}, args: {args}")
+            logger.debug(f"Known actors: {list(self.actor_command_handlers.keys())}")
+            if target_actor_name in self.actor_command_handlers:
+                logger.debug(f"Commands for {target_actor_name}: {list(self.actor_command_handlers[target_actor_name].keys())}")
+        
         if target_actor_name in self.actor_command_handlers:
             actor_handlers = self.actor_command_handlers[target_actor_name]
-            if command_name in actor_handlers:
-                handler = actor_handlers[command_name]
-
+            
+            # Try different variations of the command name
+            possible_command_names = [
+                command_name,
+                command_name.replace('-', ''),  # No hyphens
+                command_name.replace('-', '_'),  # Replace hyphens with underscores
+                command_name.lower(),  # Lowercase
+                command_name.upper()   # Uppercase
+            ]
+            
+            handler = None
+            used_command_name = None
+            
+            # Try to find a handler with any of the possible command name variations
+            for cmd_name in possible_command_names:
+                if cmd_name in actor_handlers:
+                    handler = actor_handlers[cmd_name]
+                    used_command_name = cmd_name
+                    break
+                
+            if handler:
                 if self.debug:
-                    logger.debug(f"Found handler for command: {command_name}")
-
+                    logger.debug(f"Found handler for command: {command_name} (matched as {used_command_name})")
+                    
                 try:
-                    # Execute handler
-                    result = handler(*args)
+                    # Execute handler with unpacked arguments
+                    if self.debug:
+                        logger.debug(f"Executing handler with args type: {type(args).__name__}, value: {args}")
+                        
+                    if isinstance(args, list):
+                        result = handler(*args)
+                    elif isinstance(args, dict):
+                        result = handler(**args)
+                    else:
+                        result = handler(args)
+                        
                     # Handle coroutines
                     if inspect.iscoroutine(result):
+                        if self.debug:
+                            logger.debug(f"Handler returned coroutine, awaiting result")
                         result = await result
-
+                        
                     if self.debug:
                         logger.debug(
                             f"Command executed successfully: {command_name}, result: {result}")
-
+                        
                     await self.send_response({
                         "type": "RESPONSE",
                         "targetChannel": source_channel or "",
@@ -470,7 +578,8 @@ class Vitrus:
                     if self.debug:
                         logger.debug(
                             f"Command execution failed: {command_name}, error: {str(e)}")
-
+                        logger.debug(f"Exception details: {e}", exc_info=True)
+                        
                     await self.send_response({
                         "type": "RESPONSE",
                         "targetChannel": source_channel or "",
@@ -478,9 +587,9 @@ class Vitrus:
                         "error": str(e)
                     })
             elif self.debug:
-                logger.debug(f"No handler found for command: {command_name}")
+                logger.debug(f"No handler found for command: {command_name}. Available commands: {list(actor_handlers.keys())}")
         elif self.debug:
-            logger.debug(f"No actor found with name: {target_actor_name}")
+            logger.debug(f"No actor found with name: {target_actor_name}. Known actors: {list(self.actor_command_handlers.keys())}")
 
     async def send_response(self, response: Dict[str, Any]) -> None:
         """Send a response message"""
@@ -534,7 +643,14 @@ class Vitrus:
 
         # If connected as an actor, register any pending commands
         if self.is_authenticated and actor_name:
+            if self.debug:
+                logger.debug(f"Successfully authenticated as {actor_name}, registering pending commands")
             await self._register_pending_commands(actor_name)
+            if self.debug:
+                if actor_name in self.actor_command_handlers:
+                    logger.debug(f"Commands registered for {actor_name}: {list(self.actor_command_handlers[actor_name].keys())}")
+                else:
+                    logger.debug(f"No commands found for {actor_name}")
 
         return self.is_authenticated
 
@@ -571,6 +687,9 @@ class Vitrus:
             self.actor_metadata[name] = options
 
         actor = Actor(self, name, options if options is not None else {})
+        
+        # Track this actor for cleanup
+        self.created_actors.add(actor)
 
         # If options are provided, it implies intent to *be* this actor
         if options is not None and (not self.is_authenticated or self.actor_name != name):
@@ -721,6 +840,8 @@ class Vitrus:
     async def _register_pending_commands(self, actor_name: str) -> None:
         """Register commands that might have been added via actor.on() before authentication"""
         if actor_name not in self.actor_command_handlers or actor_name not in self.actor_command_signatures:
+            if self.debug:
+                logger.debug(f"No pending commands to register for actor {actor_name}")
             return
 
         handlers = self.actor_command_handlers[actor_name]
@@ -728,25 +849,48 @@ class Vitrus:
 
         if self.debug:
             logger.debug(
-                f"Registering pending commands for actor {actor_name}...")
+                f"Registering pending commands for actor {actor_name}: {list(handlers.keys())}")
 
         for command_name, parameter_types in signatures.items():
             if command_name in handlers:  # Ensure handler still exists
                 try:
+                    if self.debug:
+                        logger.debug(f"Registering command {command_name} with server")
                     await self.register_command(actor_name, command_name, parameter_types)
                 except Exception as e:
                     logger.error(
                         f"Error registering pending command {command_name} for actor {actor_name}: {e}")
+                
+        # Double-check registration was successful
+        if self.debug:
+            logger.debug(f"Command registration complete. Registered commands for {actor_name}: {list(handlers.keys())}")
 
     def disconnect_if_actor(self, actor_name: str) -> None:
-        """Disconnects the WebSocket if the SDK is currently authenticated as the specified actor."""
+        """Disconnects the WebSocket if the SDK is currently authenticated as the specified actor.
+        Also unregisters any commands for this actor."""
         if self.actor_name == actor_name and self.is_authenticated and self.ws and self.connected:
             if self.debug:
                 logger.debug(
-                    f"Actor '{actor_name}' is disconnecting.")
+                    f"Actor '{actor_name}' is disconnecting and unregistering commands.")
+            
+            # Unregister commands from server (if needed by your server implementation)
+            try:
+                # Clear local command references
+                if actor_name in self.actor_command_handlers:
+                    self.actor_command_handlers.pop(actor_name, None)
                 
-            asyncio.create_task(self.ws.close())
-            # The message handler will manage further state changes
+                if actor_name in self.actor_command_signatures:
+                    self.actor_command_signatures.pop(actor_name, None)
+                
+                if actor_name in self.actor_metadata:
+                    self.actor_metadata.pop(actor_name, None)
+                    
+                # Close the connection - this will trigger the websocket close handler
+                asyncio.create_task(self.ws.close())
+                # The message handler will manage further state changes
+            except Exception as e:
+                if self.debug:
+                    logger.debug(f"Error during actor disconnection: {e}")
         elif self.debug:
             if self.actor_name != actor_name:
                 logger.debug(
@@ -757,3 +901,67 @@ class Vitrus:
             else:
                 logger.debug(
                     f"disconnectIfActor: WebSocket for '{actor_name}' not open or available. No action taken.")
+
+    async def disconnect(self) -> None:
+        """Disconnect from the WebSocket server and clean up all resources"""
+        if self.debug:
+            logger.debug("Disconnecting from Vitrus server and cleaning resources")
+        
+        # Disconnect if connected as an actor
+        if self.actor_name and self.is_authenticated:
+            self.disconnect_if_actor(self.actor_name)
+        # Otherwise just close the connection if it's open
+        elif self.connected and self.ws:
+            try:
+                await self.ws.close()
+            except Exception as e:
+                if self.debug:
+                    logger.debug(f"Error during WebSocket disconnection: {e}")
+        
+        # Clean up resources
+        self.connected = False
+        self.is_authenticated = False
+        self.client_id = ""
+        self.redis_channel = None
+        
+        # Clear any pending requests
+        for request_id, (future, _) in list(self.pending_requests.items()):
+            if not future.done():
+                future.set_exception(Exception("Disconnected by user"))
+        self.pending_requests.clear()
+        
+        if self.debug:
+            logger.debug("Disconnection complete")
+
+    async def _cleanup(self) -> None:
+        """Clean up resources when the SDK is being destroyed"""
+        if self.debug:
+            logger.debug("Cleaning up Vitrus resources")
+        
+        # Clean up all created actors
+        if self.created_actors:
+            if self.debug:
+                logger.debug(f"Cleaning up {len(self.created_actors)} actors")
+            
+            # Make a copy since the set might change during iteration
+            for actor in list(self.created_actors):
+                try:
+                    if self.debug:
+                        logger.debug(f"Disconnecting actor: {actor.name}")
+                    if self.actor_name == actor.name and self.is_authenticated:
+                        self.disconnect_if_actor(actor.name)
+                except Exception as e:
+                    if self.debug:
+                        logger.debug(f"Error during actor cleanup: {e}")
+        
+        # Clear the actor set
+        self.created_actors.clear()
+        
+        # Disconnect from the server
+        await self.disconnect()
+        
+        # Remove this instance from the global set
+        _vitrus_instances.discard(self)
+        
+        if self.debug:
+            logger.debug("Vitrus resources cleaned up")

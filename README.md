@@ -21,19 +21,20 @@ pip install git+https://github.com/vitrus/vitrus-sdk-python.git
 
 ```python
 import asyncio
+import os
 from vitrus import Vitrus
 
 async def main():
     # Initialize the client with all options
     vitrus = Vitrus(
-        api_key="YOUR_API_KEY",
+        api_key=os.environ.get("VITRUS_API_KEY", "YOUR_API_KEY"),
         # Optional parameters
-        world="your_world_id",  # Required for actors
+        world=os.environ.get("VITRUS_WORLD_ID", "your_world_id"),  # Required for actors
         base_url="wss://vitrus-dao.onrender.com",  # Default value
         debug=False  # Set to True for debugging
     )
     
-    # Now you can use vitrus methods
+    # Authentication happens automatically when needed
     
 asyncio.run(main())
 ```
@@ -44,17 +45,24 @@ asyncio.run(main())
 
 ```python
 import asyncio
+import os
 from vitrus import Vitrus
 
 async def main():
-    vitrus = Vitrus(api_key="YOUR_API_KEY")
+    vitrus = Vitrus(api_key=os.environ.get("VITRUS_API_KEY"))
     
-    # running a basic workflow
+    # List available workflows
+    workflows = await vitrus.list_workflows()
+    print("Available workflows:")
+    for workflow in workflows:
+        print(f"- {workflow['function']['name']}")
+    
+    # Run a basic workflow
     result = await vitrus.workflow("hello-world", {
         "prompt": "hello world!"
     })
     
-    print(result)
+    print(f"Result: {result}")
     
 asyncio.run(main())
 ```
@@ -63,19 +71,7 @@ Workflows are executed in Cloud GPUs (e.g. `Nvidia A100`), and combine multiple 
 
 ## Available Workflows
 
-We are continously updating the available workflows, and keeping them up to date with state-of-the-art (SOTA) AI models. For the latest list of workflows, you can execute:
-
-```python
-import asyncio
-from vitrus import Vitrus
-
-async def main():
-    vitrus = Vitrus(api_key="YOUR_API_KEY")
-    workflows = await vitrus.list_workflows()
-    print(workflows)
-    
-asyncio.run(main())
-```
+We are continously updating the available workflows, and keeping them up to date with state-of-the-art (SOTA) AI models. Use `list_workflows()` to see all available workflows and their schemas.
 
 # Worlds and Actors
 
@@ -83,69 +79,141 @@ Create a world at [app.vitrus.ai](https://app.vitrus.ai).
 
 ## Actors
 
+Actors are entities that can receive and respond to commands within a world.
+
 ```python
 import asyncio
+import os
 from vitrus import Vitrus
 
 async def main():
     vitrus = Vitrus(
-        api_key="YOUR_API_KEY",
-        world="YOUR_WORLD_ID"
+        api_key=os.environ.get("VITRUS_API_KEY"),
+        world=os.environ.get("VITRUS_WORLD_ID")  # Required for actors
     )
 
-    # Create an actor
+    # Create an actor with metadata
     actor = await vitrus.actor("forest", {
         "human": "Tom Hanks",
         "eyes": "green"
     })
 
     # Register a command handler
-    def walk(args):
-        print("received", args)
-        return "run forest, run!"
+    def walk(direction, speed=None):
+        print(f"Received walk command: direction={direction}, speed={speed}")
+        return f"run forest, run! Going {direction}" + (f" at {speed} speed" if speed else "")
     
+    # Register the handler
     actor.on("walk", walk)
     
+    print(f"Actor '{actor.name}' is listening for commands...")
+    print("Press Ctrl+C to exit")
+    
     # Keep the connection open
-    # In a real application, you would have your main application logic here
     try:
         while True:
             await asyncio.sleep(1)
     except KeyboardInterrupt:
-        print("Shutting down")
+        print("\nShutting down actor...")
+        actor.disconnect()
     
 asyncio.run(main())
 ```
 
 ## Agents
 
-On the Agent side, once connected to, the actor can be treated as "functions".
+On the Agent side, once connected to a world, the actor can be treated as "functions".
+
+```python
+import asyncio
+import os
+from vitrus import Vitrus
+
+async def main():
+    vitrus = Vitrus(
+        api_key=os.environ.get("VITRUS_API_KEY"),
+        world=os.environ.get("VITRUS_WORLD_ID")  # Must match actor's world
+    )
+
+    # Get a handle to an actor without providing metadata
+    # (This doesn't create the actor, just gives a handle to interact with it)
+    actor = await vitrus.actor("forest")
+
+    # Run a command on the actor with positional arguments
+    response = await actor.run("walk", "north", "fast")
+    print(f"Response: {response}")
+    
+asyncio.run(main())
+```
+
+## Scene Management
+
+For spatial applications, you can manage scenes:
 
 ```python
 import asyncio
 from vitrus import Vitrus
 
 async def main():
-    vitrus = Vitrus(
-        api_key="YOUR_API_KEY",
-        world="YOUR_WORLD_ID"  # must match actor's world
-    )
-
-    # Get a handle to an actor
-    actor = await vitrus.actor("forest")
-
-    # Run a command on the actor
-    resp = await actor.run("walk", {
-        "direction": "front"
+    vitrus = Vitrus(api_key="YOUR_API_KEY", world="YOUR_WORLD_ID")
+    
+    # Get a scene
+    scene = vitrus.scene("my-3d-environment")
+    
+    # Add an object to the scene
+    scene.add({
+        "id": "cube1",
+        "type": "cube",
+        "position": [0, 1, 0],
+        "scale": [1, 1, 1]
     })
     
-    print(resp)
+    # Update an object
+    scene.update({
+        "id": "cube1",
+        "position": [0, 2, 0]
+    })
+    
+    # Get the full scene
+    scene_data = scene.get()
+    print(scene_data)
     
 asyncio.run(main())
 ```
+
+## Error Handling
+
+The SDK uses Python's exceptions for error handling:
+
+```python
+import asyncio
+from vitrus import Vitrus
+
+async def main():
+    try:
+        vitrus = Vitrus(api_key="INVALID_API_KEY")
+        await vitrus.list_workflows()
+    except Exception as e:
+        print(f"Error: {e}")
+    
+asyncio.run(main())
+```
+
+## Troubleshooting
+
+**Connection Issues**
+- Ensure your API key is valid
+- Check that the world ID exists (if using actors)
+- Verify your internet connection and any firewall settings
+- Set `debug=True` to see detailed logs of the connection process
+
+**Actor/Command Issues**
+- Actor commands are case-sensitive
+- Ensure the actor is registered in the world before running commands
+- Parameter types should match what's expected by the handler
 
 ---
 
 # How Vitrus works internally
 
-Vitrus workflows, worlds, actors and agents runs on top of Distributed Actor Orchestration (DAO). A lightweight cloud system that enables the cross-communication of agents-world-actors. 
+Vitrus workflows, worlds, actors and agents run on top of Distributed Actor Orchestration (DAO). A lightweight cloud system that enables the cross-communication of agents-world-actors. 
