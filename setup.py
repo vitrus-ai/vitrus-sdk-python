@@ -1,39 +1,25 @@
-import setuptools
+from setuptools import setup, find_packages
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
-SDK_VERSION = "0.1.0" # Initial version for Python SDK
-
-setuptools.setup(
-    name="vitrus", # Name as it will be on PyPI
-    version=SDK_VERSION,
-    author="Vitrus AI", # Replace with actual author if different
-    author_email="support@vitrus.ai", # Replace with actual email
-    description="Python client for Vitrus multi-agent orchestration platform",
+setup(
+    name="vitrus",
+    version="0.1.0",
+    author="Vitrus Team",
+    author_email="",
+    description="Python client for interfacing with the Vitrus WebSocket server",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/vitrus-ai/vitrus-sdk-python", # Replace with actual URL
-    packages=setuptools.find_packages(), # Finds the 'vitrus' package automatically
+    url="https://github.com/vitrus/vitrus-sdk-python",
+    packages=find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
-        "Intended Audience :: Developers",
-        "Topic :: Scientific/Engineering :: Artificial Intelligence",
-        "Topic :: Software Development :: Libraries :: Python Modules",
     ],
-    python_requires='>=3.7',
+    python_requires=">=3.7",
     install_requires=[
-        "websockets>=10.0", # For WebSocket communication
+        "websockets>=10.0",
     ],
-    keywords=[
-        "vitrus", "actors", "agents", "workflows", "robotics", "ai", 
-        "ai-agents", "ai-workflows", "ai-actors", "multi-agent systems"
-    ],
-    project_urls={
-        'Documentation': 'https://vitrus.gitbook.io/docs/concepts',
-        'Source': 'https://github.com/vitrus-ai/vitrus-sdk-python', # Replace if different
-        'Tracker': 'https://github.com/vitrus-ai/vitrus-sdk-python/issues', # Replace if different
-    },
-) 
+)
