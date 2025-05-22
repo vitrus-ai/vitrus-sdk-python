@@ -1,967 +1,880 @@
-"""
-Vitrus SDK for Python
-
-A Python client for interfacing with the Vitrus WebSocket server.
-Provides an Actor/Agent communication model with workflow orchestration.
-"""
-
 import asyncio
-import inspect
 import json
 import logging
-import random
-import string
 import uuid
-import signal
-import atexit
-import threading
-import weakref
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+import inspect
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Callable,
+    Coroutine,
+    Tuple,
+    TypeVar,
+    Union,
+    Mapping,
+    Awaitable
+)
+from enum import Enum
 
+# Using websockets library for Python
 import websockets
+from websockets.client import WebSocketClientProtocol
+from websockets.exceptions import ConnectionClosed, ConnectionClosedError, ConnectionClosedOK
 
-# SDK version
-SDK_VERSION = "0.1.0"
-DEFAULT_BASE_URL = 'wss://vitrus-dao.onrender.com'
+# Setup basic logging
+logger = logging.getLogger(__name__)
 
-# Configure logging
-logger = logging.getLogger("vitrus")
+# --- SDK Version ---
+SDK_VERSION = "0.1.0"  # Placeholder, similar to TS fallback
+DEFAULT_BASE_URL = "wss://vitrus-dao.onrender.com"
 
-# Track all Vitrus instances for global cleanup
-_vitrus_instances = weakref.WeakSet()
+# --- Message Type Definitions (using TypedDict for clarity) ---
+# In Python, we'd typically use dataclasses or TypedDict for these.
+# For simplicity matching the TS interfaces, TypedDict is closer.
+try:
+    from typing import TypedDict, Literal
+except ImportError:
+    # For Python < 3.8
+    from typing_extensions import TypedDict, Literal
 
-# Flag to track if signal handlers are set up
-_signal_handlers_installed = False
 
-# Function to handle cleanup on exit
-def _global_cleanup():
-    """Clean up all Vitrus instances on program exit"""
-    loop = None
+class HandshakeMessage(TypedDict):
+    type: Literal['HANDSHAKE']
+    apiKey: str
+    worldId: Optional[str]
+    actorName: Optional[str]
+    metadata: Optional[Any]
+
+
+class HandshakeResponseMessage(TypedDict):
+    type: Literal['HANDSHAKE_RESPONSE']
+    success: bool
+    clientId: str
+    userId: Optional[str]
+    error_code: Optional[str]
+    redisChannel: Optional[str]
+    message: Optional[str]
+    actorInfo: Optional[Dict[str, Any]] # Contains metadata and registeredCommands
+
+
+class CommandMessage(TypedDict):
+    type: Literal['COMMAND']
+    targetActorName: str
+    commandName: str
+    args: List[Any]
+    requestId: str
+    sourceChannel: Optional[str]
+
+
+class ResponseMessage(TypedDict):
+    type: Literal['RESPONSE']
+    targetChannel: str
+    requestId: str
+    result: Optional[Any]
+    error: Optional[str]
+
+
+class RegisterCommandMessage(TypedDict):
+    type: Literal['REGISTER_COMMAND']
+    actorName: str
+    commandName: str
+    parameterTypes: List[str]
+
+
+class WorkflowMessage(TypedDict):
+    type: Literal['WORKFLOW']
+    workflowName: str
+    args: Any
+    requestId: str
+
+
+class WorkflowResultMessage(TypedDict):
+    type: Literal['WORKFLOW_RESULT']
+    requestId: str
+    result: Optional[Any]
+    error: Optional[str]
+
+
+class JSONSchema(TypedDict, total=False):
+    type: Literal['object', 'string', 'number', 'boolean', 'array']
+    description: Optional[str]
+    properties: Optional[Dict[str, 'JSONSchema']]
+    required: Optional[List[str]]
+    items: Optional['JSONSchema']
+    additionalProperties: Optional[bool]
+
+
+class OpenAITool(TypedDict):
+    name: str
+    description: Optional[str]
+    parameters: JSONSchema
+    strict: Optional[bool]
+
+
+class WorkflowDefinition(TypedDict):
+    type: Literal['function']
+    function: OpenAITool
+
+
+class ListWorkflowsMessage(TypedDict):
+    type: Literal['LIST_WORKFLOWS']
+    requestId: str
+
+
+class WorkflowListMessage(TypedDict):
+    type: Literal['WORKFLOW_LIST']
+    requestId: str
+    workflows: Optional[List[WorkflowDefinition]]
+    error: Optional[str]
+
+
+# --- Utility for extracting parameter types ---
+def get_parameter_types(func: Callable) -> List[str]:
+    """
+    Extracts parameter type annotations from a function.
+    Defaults to 'any' if no annotation is found.
+    """
     try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        # Create a new event loop if none exists
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    
-    if loop and not loop.is_closed():
-        for instance in list(_vitrus_instances):
-            if hasattr(instance, '_cleanup') and callable(instance._cleanup):
-                try:
-                    loop.run_until_complete(instance._cleanup())
-                except Exception as e:
-                    logger.debug(f"Error during Vitrus instance cleanup: {e}")
-
-# Register cleanup with atexit
-atexit.register(_global_cleanup)
-
-# Signal handler for graceful shutdown
-def _signal_handler(sig, frame):
-    """Handle termination signals by cleaning up all Vitrus instances"""
-    logger.debug(f"Received signal {sig}, initiating Vitrus SDK cleanup")
-    _global_cleanup()
-    
-# Install signal handlers
-def _install_signal_handlers():
-    """Install signal handlers if not already done"""
-    global _signal_handlers_installed
-    if not _signal_handlers_installed:
-        try:
-            signal.signal(signal.SIGINT, _signal_handler)
-            signal.signal(signal.SIGTERM, _signal_handler)
-            _signal_handlers_installed = True
-        except (ValueError, AttributeError):
-            # This happens when not in the main thread
-            pass
-
-class Scene:
-    """Scene class for managing scene objects"""
-
-    def __init__(self, vitrus, scene_id: str):
-        self.vitrus = vitrus
-        self.scene_id = scene_id
-
-    def set(self, structure: Any) -> None:
-        """Set a structure to the scene"""
-        # Implementation would update scene structure
-        pass
-
-    def add(self, obj: Any) -> None:
-        """Add an object to the scene"""
-        # Implementation would add object to scene
-        pass
-
-    def update(self, params: Dict[str, Any]) -> None:
-        """Update an object in the scene"""
-        # Implementation would update object in scene
-        pass
-
-    def remove(self, object_id: str) -> None:
-        """Remove an object from the scene"""
-        # Implementation would remove object from scene
-        pass
-
-    def get(self) -> Dict[str, Any]:
-        """Get the scene"""
-        # Implementation would fetch scene data
-        return {"id": self.scene_id}
-
-
-class Actor:
-    """Actor/Player class"""
-
-    def __init__(self, vitrus, name: str, metadata: Dict[str, Any] = None):
-        self.vitrus = vitrus
-        self.name = name
-        self.metadata = metadata or {}
-        self.command_handlers = {}
-        
-    def __del__(self):
-        """Destructor to ensure cleanup"""
-        try:
-            # We can't use async in __del__, so just remove from tracking
-            if hasattr(self, 'vitrus') and hasattr(self.vitrus, 'created_actors'):
-                self.vitrus.created_actors.discard(self)
-        except Exception:
-            # Never raise exceptions in __del__
-            pass
-
-    def on(self, command_name: str, handler: Callable) -> 'Actor':
-        """Register a command handler"""
-        self.command_handlers[command_name] = handler
-        
-        # Extract parameter types
-        parameter_types = self._get_parameter_types(handler)
-        
-        # Register with Vitrus (local handler map)
-        self.vitrus.register_actor_command_handler(
-            self.name, command_name, handler, parameter_types)
-        
-        # Register command with server *only if* currently connected as this actor
-        if self.vitrus.is_authenticated and self.vitrus.actor_name == self.name:
-            # For debugging
-            if self.vitrus.debug:
-                logger.debug(f"Registering command {command_name} with the server for actor {self.name}")
-            
-            # Create a task but don't await it to avoid blocking
-            asyncio.create_task(self.vitrus.register_command(
-                self.name, command_name, parameter_types))
-        elif self.vitrus.debug:
-            logger.debug(
-                f"Not sending REGISTER_COMMAND for {command_name} on {self.name} as SDK is not authenticated as this actor.")
-        
-        return self
-
-    async def run(self, command_name: str, *args) -> Any:
-        """Run a command on an actor"""
-        return await self.vitrus.run_command(self.name, command_name, args)
-
-    def get_metadata(self) -> Dict[str, Any]:
-        """Get actor metadata"""
-        return self.metadata
-
-    def update_metadata(self, new_metadata: Dict[str, Any]) -> None:
-        """Update actor metadata"""
-        self.metadata.update(new_metadata)
-        # TODO: Send metadata update to server
-
-    async def disconnect(self) -> None:
-        """Disconnect the actor asynchronously if the SDK is currently connected as this actor."""
-        # Call the SDK disconnection method for this actor
-        self.vitrus.disconnect_if_actor(self.name)
-        
-        # If we need to do a full async disconnection with the SDK
-        await self.vitrus.disconnect()
-
-    def _get_parameter_types(self, func: Callable) -> List[str]:
-        """Extract parameter types from function signature"""
         sig = inspect.signature(func)
-        param_types = []
-
+        param_types: List[str] = []
         for param in sig.parameters.values():
-            # Skip 'self' parameter for methods
-            if param.name == 'self':
-                continue
-
-            # Try to extract type information if available
             if param.annotation is not inspect.Parameter.empty:
-                param_types.append(str(param.annotation.__name__))
+                if hasattr(param.annotation, '__name__'):
+                    param_types.append(param.annotation.__name__)
+                elif hasattr(param.annotation, '_name') and param.annotation._name: # for things like typing.List
+                    param_types.append(str(param.annotation))
+                elif hasattr(param.annotation, '__origin__'): # For List[str] etc.
+                     param_types.append(str(param.annotation).replace('typing.',''))
+                else:
+                    param_types.append(str(param.annotation)) 
             else:
                 param_types.append('any')
-
         return param_types
+    except (ValueError, TypeError): # inspect.signature can fail on some callables
+        try: # Fallback for builtins or weird callables without full signature support
+            return ['any'] * len(inspect.getfullargspec(func).args)
+        except: # Absolute fallback
+             return []
 
 
+T = TypeVar('T')
+
+# Forward declaration for Vitrus class
 class Vitrus:
-    """Main Vitrus class"""
+    pass
 
-    def __init__(self, api_key: str, world: str = None, base_url: str = DEFAULT_BASE_URL, debug: bool = False):
-        self.api_key = api_key
-        self.world_id = world
-        self.base_url = base_url
-        self.debug = debug
-        self.ws = None
-        self.client_id = ""
-        self.connected = False
-        self.is_authenticated = False
-        self.actor_name = None
-        self.redis_channel = None
-        self.message_handlers = {}
-        self.pending_requests = {}
-        self.actor_command_handlers = {}
-        self.actor_command_signatures = {}
-        self.actor_metadata = {}
-        self.connection_task = None
-        self.created_actors = set()  # Track all actors created by this instance
+# --- Actor Class ---
+class Actor:
+    _vitrus: "Vitrus"
+    _name: str
+    _metadata: Dict[str, Any]
+    # Command handlers are stored in Vitrus instance: _vitrus._actor_command_handlers
 
-        if self.debug:
-            logger.setLevel(logging.DEBUG)
-            logger.debug(
-                f"Vitrus v{SDK_VERSION} initializing with options: {{'apiKey': '***', 'world': {world}, 'baseUrl': {base_url}, 'debug': {debug}}}")
+    def __init__(self, vitrus_client: "Vitrus", name: str, metadata: Optional[Dict[str, Any]] = None):
+        self._vitrus = vitrus_client
+        self._name = name
+        self._metadata = metadata if metadata is not None else {}
+        # _command_handlers are stored in the Vitrus client instance to keep Actor light
 
-        # Add this instance to the global set for cleanup
-        _vitrus_instances.add(self)
-        
-        # Install signal handlers
-        _install_signal_handlers()
+    def on(self, command_name: str, handler: Callable[..., Awaitable[Any]]):
+        """
+        Register a command handler for this actor.
+        The handler can be a regular function or an async function.
+        It will be called with arguments passed from the `run` command.
+        """
+        parameter_types = get_parameter_types(handler)
+        self._vitrus.register_actor_command_handler(self._name, command_name, handler, parameter_types)
 
-    async def connect(self, actor_name: str = None, metadata: Dict[str, Any] = None) -> None:
-        """Connect to the WebSocket server with authentication"""
-        if self.connection_task and not self.connection_task.done():
-            await self.connection_task
-            return
+        if self._vitrus.is_authenticated and self._vitrus.actor_name == self._name:
+            asyncio.create_task(self._vitrus.register_command(self._name, command_name, parameter_types))
+        elif self._vitrus.debug:
+            logger.info(f"[Vitrus SDK - Actor.on] Queuing REGISTER_COMMAND for {command_name} on {self._name}. Will send after auth.")
+        return self
 
-        self.actor_name = actor_name or self.actor_name
-        if self.actor_name and metadata:
-            self.actor_metadata[self.actor_name] = metadata
+    async def run(self, command_name: str, *args: Any) -> Any:
+        """
+        Run a command on this actor (implies this instance is an agent-side handle).
+        """
+        return await self._vitrus.run_command(self._name, command_name, list(args))
 
-        self.connection_task = asyncio.create_task(
-            self._establish_websocket_connection())
-        await self.connection_task
+    @property
+    def name(self) -> str:
+        return self._name
 
-    async def _establish_websocket_connection(self) -> None:
-        """Establish WebSocket connection and handle authentication"""
-        if self.debug:
-            logger.debug(
-                f"Attempting to connect to WebSocket server: {self.base_url}")
-        
-        url = self.base_url
-        # Add query parameters
-        url += f"?apiKey={self.api_key}"
-        if self.world_id:
-            url += f"&worldId={self.world_id}"
-        
-        try:
-            self.ws = await websockets.connect(url)
-            self.connected = True
-            
-            if self.debug:
-                logger.debug("Connected to WebSocket server")
-            
-            # Send HANDSHAKE message
-            handshake_msg = {
-                "type": "HANDSHAKE",
-                "apiKey": self.api_key,
-                "worldId": self.world_id,
-                "actorName": self.actor_name,
-                "metadata": self.actor_metadata.get(self.actor_name) if self.actor_name else None
-            }
-            
-            if self.debug:
-                logger.debug(f"Sending HANDSHAKE message: {handshake_msg}")
-            
-            await self.send_message(handshake_msg)
-            
-            # We'll start the message handler in _wait_for_authentication after auth completes
-            # Wait for authentication
-            await self._wait_for_authentication()
-            
-        except Exception as e:
-            self.connected = False
-            error_msg = f"Connection failed: {str(e)}"
-            if self.world_id:
-                error_msg = f"Connection Failed: Unable to connect to world '{self.world_id}'. This world may not exist, or the API key may be invalid. Original: {str(e)}"
-            
-            logger.error(error_msg)
-            if self.debug:
-                logger.debug(f"WebSocket connection error: {e}")
-            
-            raise Exception(error_msg)
+    @property
+    def metadata(self) -> Dict[str, Any]:
+        return self._metadata
 
-    async def _message_handler(self) -> None:
-        """Handle incoming WebSocket messages"""
-        try:
-            async for message in self.ws:
-                try:
-                    data = json.loads(message)
-                    if self.debug and data.get("type") != "HANDSHAKE_RESPONSE":
-                        logger.debug(f"Received message: {data}")
+    def update_metadata(self, new_metadata: Dict[str, Any]):
+        self._metadata.update(new_metadata)
+        if self._vitrus.actor_name == self._name and self._vitrus.is_authenticated:
+            # The TS SDK has a TODO for sending metadata update to server. Mirroring that.
+            logger.debug(f"Metadata updated for actor {self._name}. Server update not yet implemented in SDK protocol.")
 
-                    await self._handle_message(data)
-                except json.JSONDecodeError:
-                    logger.error(f"Error parsing WebSocket message: {message}")
-        except websockets.exceptions.ConnectionClosed as e:
-            self.connected = False
-            self.is_authenticated = False
-            logger.error(f"WebSocket connection closed: {e}")
 
-            # Reject any pending requests
-            for request_id, (future, _) in self.pending_requests.items():
-                if not future.done():
-                    future.set_exception(Exception(f"Connection lost: {e}"))
+    def disconnect(self) -> None:
+        """
+        Disconnect the actor if the SDK is currently connected as this actor.
+        """
+        self._vitrus.disconnect_if_actor(self._name)
 
-    async def _wait_for_authentication(self) -> None:
-        """Wait for authentication to complete"""
-        if self.is_authenticated:
-            return
-        
-        if self.debug:
-            logger.debug("Waiting for authentication...")
-        
-        auth_future = asyncio.Future()
-        
-        async def handle_auth_response(message):
-            if self.debug:
-                logger.debug(f"Processing auth response: {message}")
-                
-            if message["type"] == "HANDSHAKE_RESPONSE":
-                response = message
-                if response["success"]:
-                    self.client_id = response["clientId"]
-                    self.redis_channel = response.get("redisChannel")
-                    self.is_authenticated = True
-                    
-                    # If actor info was included, restore it
-                    if response.get("actorInfo") and self.actor_name:
-                        # Store the actor metadata
-                        self.actor_metadata[self.actor_name] = response["actorInfo"]["metadata"]
-                        
-                        # Re-register existing commands if available
-                        if response["actorInfo"].get("registeredCommands"):
-                            if self.debug:
-                                logger.debug(
-                                    f"Restoring registered commands: {response['actorInfo']['registeredCommands']}")
-                            
-                            # Create a signature map if it doesn't exist
-                            if self.actor_name not in self.actor_command_signatures:
-                                self.actor_command_signatures[self.actor_name] = {
-                                }
-                            
-                            # Restore command signatures
-                            signatures = self.actor_command_signatures[self.actor_name]
-                            for cmd in response["actorInfo"]["registeredCommands"]:
-                                signatures[cmd["name"]] = cmd["parameterTypes"]
-                
-                    if self.debug:
-                        logger.debug(
-                            f"Authentication successful, clientId: {self.client_id}")
-                
-                    auth_future.set_result(True)
-                else:
-                    error_message = response.get(
-                        "message", "Authentication failed")
-                    # Check for specific error codes
-                    if response.get("error_code") == "invalid_api_key":
-                        error_message = "Authentication Failed: The provided API Key is invalid or expired."
-                    elif response.get("error_code") == "world_not_found":
-                        error_message = response.get(
-                            "message") or "Connection Failed: The world specified in the connection URL was not found."
-                    elif response.get("error_code") == "world_not_found_handshake":
-                        error_message = response.get(
-                            "message") or "Connection Failed: The world specified in the handshake message was not found."
-                    elif "Actors require a worldId" in error_message:
-                        error_message = "Connection Failed: An actor connection requires a valid World ID to be specified."
-                    
-                    if self.debug:
-                        logger.debug(f"Authentication failed: {error_message}")
-                    
-                    auth_future.set_exception(Exception(error_message))
-        
-        # Set up a direct message handler for this specific authentication request
-        async def message_listener():
-            try:
-                async for message in self.ws:
-                    try:
-                        data = json.loads(message)
-                        if self.debug:
-                            logger.debug(f"Auth listener received: {data}")
-                        if data.get("type") == "HANDSHAKE_RESPONSE":
-                            await handle_auth_response(data)
-                            # Exit the loop once authentication is handled
-                            if auth_future.done():
-                                break
-                    except json.JSONDecodeError:
-                        logger.error(f"Error parsing WebSocket message during auth: {message}")
-            except Exception as e:
-                if not auth_future.done():
-                    auth_future.set_exception(e)
-        
-        # Start listening for messages
-        listener_task = asyncio.create_task(message_listener())
-        
-        try:
-            # Wait for authentication to complete
-            await auth_future
-        finally:
-            # Cancel the listener task if it's still running
-            if not listener_task.done():
-                listener_task.cancel()
-                try:
-                    await listener_task
-                except asyncio.CancelledError:
-                    pass
-            
-            # Start the regular message handler if it's not running yet
-            if self.is_authenticated:
-                asyncio.create_task(self._message_handler())
 
-    async def send_message(self, message: Dict[str, Any]) -> None:
-        """Send a message to the WebSocket server"""
-        if not self.connected:
-            await self.connect()
-            
-        if self.ws and self.connected:
-            if self.debug:
-                logger.debug(
-                    f"Sending message: {message}")
-                
-            await self.ws.send(json.dumps(message))
+# --- Scene Class (Placeholder as in TS) ---
+class Scene:
+    _vitrus: "Vitrus"
+    _scene_id: str
+
+    def __init__(self, vitrus_client: "Vitrus", scene_id: str):
+        self._vitrus = vitrus_client
+        self._scene_id = scene_id
+
+    def set_structure(self, structure: Any):
+        logger.warning("Scene.set_structure is not yet implemented.")
+
+    def add(self, obj: Any):
+        logger.warning("Scene.add is not yet implemented.")
+
+    def update(self, params: Dict[str, Any]):
+        logger.warning("Scene.update is not yet implemented.")
+
+    def remove(self, object_id: str):
+        logger.warning("Scene.remove is not yet implemented.")
+
+    def get(self) -> Dict[str, Any]:
+        logger.warning("Scene.get is not yet implemented.")
+        return {"id": self._scene_id}
+
+
+# --- Main Vitrus Class ---
+class Vitrus:
+    _ws: Optional[WebSocketClientProtocol]
+    _api_key: str
+    _world_id: Optional[str]
+    _client_id: str
+    _is_connected: bool
+    _is_authenticated: bool
+    _message_handlers: Dict[str, List[Callable[[Dict[str, Any]], None]]]
+    _pending_requests: Dict[str, asyncio.Future]
+    _actor_command_handlers: Dict[str, Dict[str, Callable[..., Awaitable[Any]]]]
+    _actor_command_signatures: Dict[str, Dict[str, List[str]]]
+    _actor_metadata: Dict[str, Any]
+    _base_url: str
+    _debug: bool
+    _current_actor_name: Optional[str]
+    _connection_lock: asyncio.Lock
+    _receive_task: Optional[asyncio.Task]
+    _redis_channel: Optional[str]
+
+
+    def __init__(self, api_key: str, world: Optional[str] = None, base_url: str = DEFAULT_BASE_URL, debug: bool = False):
+        self._api_key = api_key
+        self._world_id = world
+        self._base_url = base_url
+        self._debug = debug
+
+        self._ws = None
+        self._client_id = ""
+        self._is_connected = False
+        self._is_authenticated = False
+        self._message_handlers = {}
+        self._pending_requests = {}
+        self._actor_command_handlers = {}
+        self._actor_command_signatures = {}
+        self._actor_metadata = {}
+        self._current_actor_name = None
+        self._connection_lock = asyncio.Lock()
+        self._receive_task = None
+        self._redis_channel = None
+
+        if self._debug:
+            # Ensure logger is configured to show INFO level for debug mode
+            if not logger.handlers: # Configure only if no handlers are set
+                logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            else: # If handlers exist, just set level for this logger
+                logger.setLevel(logging.INFO)
+            logger.info(f"[Vitrus v{SDK_VERSION}] Initializing with options: api_key=****, world={world}, base_url={base_url}, debug={debug}")
         else:
-            if self.debug:
-                logger.debug(
-                    "Failed to send message - WebSocket not connected")
+            if not logger.handlers:
+                logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            else:
+                 logger.setLevel(logging.WARNING)
+
+
+    async def _connect(self, actor_name_intent: Optional[str] = None, actor_metadata_intent: Optional[Dict[str, Any]] = None) -> None:
+        async with self._connection_lock:
+            if self._is_connected and self._is_authenticated:
+                if actor_name_intent and self._current_actor_name != actor_name_intent:
+                    if self._debug: logger.info(f"Re-authenticating as actor: {actor_name_intent}")
+                    await self._close_ws_internal()
+                elif self._current_actor_name == actor_name_intent:
+                    return
+
+            if self._ws:
+                 await self._close_ws_internal()
+
+            self._current_actor_name = actor_name_intent or self._current_actor_name
+            if self._current_actor_name and actor_metadata_intent:
+                self._actor_metadata[self._current_actor_name] = actor_metadata_intent
+
+            query_params = f"?apiKey={self._api_key}"
+            if self._world_id:
+                query_params += f"&worldId={self._world_id}"
+            
+            full_url = f"{self._base_url}{query_params}"
+
+            if self._debug:
+                logger.info(f"[Vitrus] Attempting to connect to WebSocket server: {full_url}")
+
+            try:
+                self._ws = await websockets.connect(full_url, ping_interval=20, ping_timeout=20)
+                self._is_connected = True
+                if self._debug:
+                    logger.info("[Vitrus] WebSocket connection established (pre-handshake).")
+
+                self._receive_task = asyncio.create_task(self._receive_loop())
+
+                handshake_msg: HandshakeMessage = {
+                    "type": "HANDSHAKE",
+                    "apiKey": self._api_key,
+                    "worldId": self._world_id,
+                    "actorName": self._current_actor_name,
+                    "metadata": self._actor_metadata.get(self._current_actor_name) if self._current_actor_name else None,
+                }
+                await self._send_message_internal_ws(handshake_msg)
+
+                auth_future = asyncio.Future()
+                self._pending_requests["HANDSHAKE_RESPONSE"] = auth_future
                 
-            raise Exception("WebSocket is not connected")
-
-    async def _handle_message(self, message: Dict[str, Any]) -> None:
-        """Handle incoming WebSocket messages"""
-        message_type = message.get("type")
-
-        # Handle handshake response
-        if message_type == "HANDSHAKE_RESPONSE":
-            # This is handled in _wait_for_authentication
-            pass
-
-        # Handle command from another client
-        elif message_type == "COMMAND":
-            if self.debug:
-                logger.debug(f"Received command: {message}")
-
-            await self._handle_command(message)
-
-        # Handle response from actor
-        elif message_type == "RESPONSE":
-            request_id = message.get("requestId")
-            result = message.get("result")
-            error = message.get("error")
-
-            if self.debug:
-                logger.debug(
-                    f"Received response for requestId: {request_id}, result: {result}, error: {error}")
-
-            if request_id in self.pending_requests:
-                future, _ = self.pending_requests.pop(request_id)
-                if error:
-                    future.set_exception(Exception(error))
-                else:
-                    future.set_result(result)
-
-        # Handle workflow results
-        elif message_type == "WORKFLOW_RESULT":
-            request_id = message.get("requestId")
-            result = message.get("result")
-            error = message.get("error")
-
-            if self.debug:
-                logger.debug(
-                    f"Received workflow result for requestId: {request_id}, result: {result}, error: {error}")
-
-            if request_id in self.pending_requests:
-                future, _ = self.pending_requests.pop(request_id)
-                if error:
-                    future.set_exception(Exception(error))
-                else:
-                    future.set_result(result)
-
-        # Handle workflow list response
-        elif message_type == "WORKFLOW_LIST":
-            request_id = message.get("requestId")
-            workflows = message.get("workflows")
-            error = message.get("error")
-
-            if self.debug:
-                logger.debug(
-                    f"Received workflow list for requestId: {request_id}, workflows: {workflows}, error: {error}")
-
-            if request_id in self.pending_requests:
-                future, _ = self.pending_requests.pop(request_id)
-                if error:
-                    future.set_exception(Exception(error))
-                else:
-                    future.set_result(workflows or [])
-
-        # Handle custom message types
-        elif message_type in self.message_handlers:
-            for handler in self.message_handlers[message_type]:
-                handler(message)
-
-    async def _handle_command(self, message: Dict[str, Any]) -> None:
-        """Handle incoming command message"""
-        command_name = message.get("commandName")
-        args = message.get("args", [])
-        request_id = message.get("requestId")
-        target_actor_name = message.get("targetActorName")
-        source_channel = message.get("sourceChannel")
-        
-        if self.debug:
-            logger.debug(
-                f"Handling command: {command_name} for actor {target_actor_name}, requestId: {request_id}, args: {args}")
-            logger.debug(f"Known actors: {list(self.actor_command_handlers.keys())}")
-            if target_actor_name in self.actor_command_handlers:
-                logger.debug(f"Commands for {target_actor_name}: {list(self.actor_command_handlers[target_actor_name].keys())}")
-        
-        if target_actor_name in self.actor_command_handlers:
-            actor_handlers = self.actor_command_handlers[target_actor_name]
-            
-            # Try different variations of the command name
-            possible_command_names = [
-                command_name,
-                command_name.replace('-', ''),  # No hyphens
-                command_name.replace('-', '_'),  # Replace hyphens with underscores
-                command_name.lower(),  # Lowercase
-                command_name.upper()   # Uppercase
-            ]
-            
-            handler = None
-            used_command_name = None
-            
-            # Try to find a handler with any of the possible command name variations
-            for cmd_name in possible_command_names:
-                if cmd_name in actor_handlers:
-                    handler = actor_handlers[cmd_name]
-                    used_command_name = cmd_name
-                    break
-                
-            if handler:
-                if self.debug:
-                    logger.debug(f"Found handler for command: {command_name} (matched as {used_command_name})")
-                    
                 try:
-                    # Execute handler with unpacked arguments
-                    if self.debug:
-                        logger.debug(f"Executing handler with args type: {type(args).__name__}, value: {args}")
-                        
-                    if isinstance(args, list):
-                        result = handler(*args)
-                    elif isinstance(args, dict):
-                        result = handler(**args)
-                    else:
-                        result = handler(args)
-                        
-                    # Handle coroutines
-                    if inspect.iscoroutine(result):
-                        if self.debug:
-                            logger.debug(f"Handler returned coroutine, awaiting result")
-                        result = await result
-                        
-                    if self.debug:
-                        logger.debug(
-                            f"Command executed successfully: {command_name}, result: {result}")
-                        
-                    await self.send_response({
-                        "type": "RESPONSE",
-                        "targetChannel": source_channel or "",
-                        "requestId": request_id,
-                        "result": result
-                    })
+                    await asyncio.wait_for(auth_future, timeout=15.0) 
+                    self._is_authenticated = auth_future.result() 
+                    if not self._is_authenticated:
+                         raise ConnectionError(f"Authentication failed: {auth_future.exception() or 'Server rejected handshake'}")
+                    if self._debug:
+                        logger.info(f"[Vitrus] Authentication successful. Client ID: {self._client_id}, Actor: {self._current_actor_name or 'Agent'}")
+
+                except asyncio.TimeoutError:
+                    logger.error("[Vitrus] Authentication timed out.")
+                    await self._close_ws_internal(graceful=False)
+                    raise ConnectionError("Authentication timed out.")
                 except Exception as e:
-                    if self.debug:
-                        logger.debug(
-                            f"Command execution failed: {command_name}, error: {str(e)}")
-                        logger.debug(f"Exception details: {e}", exc_info=True)
-                        
-                    await self.send_response({
-                        "type": "RESPONSE",
-                        "targetChannel": source_channel or "",
-                        "requestId": request_id,
-                        "error": str(e)
-                    })
-            elif self.debug:
-                logger.debug(f"No handler found for command: {command_name}. Available commands: {list(actor_handlers.keys())}")
-        elif self.debug:
-            logger.debug(f"No actor found with name: {target_actor_name}. Known actors: {list(self.actor_command_handlers.keys())}")
+                    logger.error(f"[Vitrus] Authentication failed during handshake wait: {e}")
+                    await self._close_ws_internal(graceful=False)
+                    raise ConnectionError(f"Authentication failed: {e}")
 
-    async def send_response(self, response: Dict[str, Any]) -> None:
-        """Send a response message"""
-        if self.debug:
-            logger.debug(f"Sending response: {response}")
+            except websockets.exceptions.InvalidURI:
+                logger.error(f"[Vitrus] Invalid WebSocket URI: {full_url}")
+                self._is_connected = False; self._is_authenticated = False
+                raise ConnectionError(f"Invalid WebSocket URI: {full_url}")
+            except websockets.exceptions.WebSocketException as e: # Covers handshake errors, connection refused etc.
+                logger.error(f"[Vitrus] WebSocket connection failed: {type(e).__name__} - {e}")
+                self._is_connected = False; self._is_authenticated = False
+                specific_error_msg = str(e)
+                if self._world_id:
+                    specific_error_msg = f"Connection Failed: Unable to connect to world '{self._world_id}'. This world may not exist, or the API key may be invalid. Original error: {type(e).__name__} - {e}"
+                else:
+                    specific_error_msg = f"Connection Failed: Unable to establish initial WebSocket connection. Original error: {type(e).__name__} - {e}"
+                raise ConnectionError(specific_error_msg)
+            except ConnectionError: # Re-raise auth errors from handshake wait
+                await self._close_ws_internal(graceful=False)
+                raise
+            except Exception as e:
+                logger.error(f"[Vitrus] An unexpected error occurred during connection: {type(e).__name__} - {e}")
+                await self._close_ws_internal(graceful=False)
+                self._is_connected = False; self._is_authenticated = False
+                raise ConnectionError(f"Unexpected error during connection: {e}")
 
-        await self.send_message(response)
 
-    async def register_command(self, actor_name: str, command_name: str, parameter_types: List[str]) -> None:
-        """Register a command with the server"""
-        if self.debug:
-            logger.debug(
-                f"Registering command with server: actor={actor_name}, command={command_name}, params={parameter_types}")
+    async def _close_ws_internal(self, graceful: bool = True):
+        """Internal method to close WebSocket and cleanup tasks."""
+        if self._receive_task and not self._receive_task.done():
+            self._receive_task.cancel()
+            try:
+                await self._receive_task
+            except asyncio.CancelledError:
+                if self._debug: logger.info("[Vitrus] Message receive task cancelled.")
+            except Exception as e:
+                if self._debug: logger.info(f"[Vitrus] Exception in receive task during its cancellation: {type(e).__name__} - {e}")
+        self._receive_task = None
 
-        message = {
-            "type": "REGISTER_COMMAND",
-            "actorName": actor_name,
-            "commandName": command_name,
-            "parameterTypes": parameter_types
-        }
+        if self._ws_is_open():
+            try:
+                if graceful:
+                    await self._ws.close()
+                else:
+                    # For non-graceful close, try different approaches based on websockets version
+                    if hasattr(self._ws, 'close_connection'):
+                        # Legacy websockets versions - check if it's a coroutine
+                        if inspect.iscoroutinefunction(self._ws.close_connection):
+                            await self._ws.close_connection()
+                        else:
+                            self._ws.close_connection()
+                    else:
+                        # Newer versions - just close normally but don't wait
+                        await self._ws.close()
+                if self._debug: logger.info("[Vitrus] WebSocket connection closed.")
+            except Exception as e:
+                if self._debug: logger.warning(f"[Vitrus] Error while closing WebSocket: {type(e).__name__} - {e}")
+        
+        self._ws = None
+        self._is_connected = False
+        self._is_authenticated = False 
 
-        await self.send_message(message)
+        disconnect_error = ConnectionError("Connection Lost: The connection to the Vitrus server was closed.")
+        for request_id, fut in list(self._pending_requests.items()): # Iterate over a copy
+            if not fut.done():
+                fut.set_exception(disconnect_error)
+            self._pending_requests.pop(request_id, None)
+
+
+    async def _receive_loop(self):
+        if not self._ws: return
+        try:
+            async for message_str in self._ws:
+                if self._debug and isinstance(message_str, str):
+                     try:
+                        temp_msg = json.loads(message_str)
+                        # Avoid logging entire handshake response in debug unless extremely verbose debugging is on
+                        if temp_msg.get("type") != "HANDSHAKE_RESPONSE" or logger.getEffectiveLevel() <= logging.DEBUG - 5:
+                            logger.info(f"[Vitrus] Raw message received: {message_str}")
+                        elif temp_msg.get("type") == "HANDSHAKE_RESPONSE":
+                            logger.info(f"[Vitrus] Received HANDSHAKE_RESPONSE (content partially omitted for brevity in standard debug).")
+                     except json.JSONDecodeError:
+                         logger.info(f"[Vitrus] Raw non-JSON message received: {message_str}")
+
+                try:
+                    message = json.loads(message_str)
+                    self._handle_message(message)
+                except json.JSONDecodeError:
+                    logger.error(f"Error parsing WebSocket message as JSON: {message_str[:200]}...") # Log snippet
+                except Exception as e: # Catch broad errors in message handling
+                    logger.error(f"Error processing message: {type(e).__name__} - {e}. Message snippet: {message_str[:200]}...")
+        
+        except ConnectionClosedOK:
+            if self._debug: logger.info("[Vitrus] WebSocket connection closed normally by server.")
+        except ConnectionClosedError as e: # Connection closed with an error code
+            logger.error(f"[Vitrus] WebSocket connection closed with error: Code {e.code}, Reason: '{e.reason}'")
+        except ConnectionClosed as e: # More general closed connection
+            logger.error(f"[Vitrus] WebSocket connection closed unexpectedly: Code {e.code}, Reason: '{e.reason}'")
+        except asyncio.CancelledError:
+            if self._debug: logger.info("[Vitrus] Receive loop was cancelled.")
+            # Do not re-raise, cancellation is part of shutdown
+        except Exception as e: # Other unexpected errors in the loop itself
+            if self._debug or not isinstance(e, websockets.exceptions.WebSocketException): # Don't be too noisy for common WS closure exceptions if not debugging
+                logger.error(f"[Vitrus] Unexpected error in receive loop: {type(e).__name__} - {e}")
+        finally:
+            if self._debug: logger.info("[Vitrus] Exiting receive loop.")
+            # Ensure connection state is updated if loop exits unexpectedly
+            if self._is_connected or self._is_authenticated: # If it wasn't an intentional close from our side that already cleaned up
+                 await self._close_ws_internal(graceful=False)
+
+
+    async def _send_message_internal_ws(self, message: Dict[str, Any]):
+        if self._ws_is_open():
+            msg_str = json.dumps(message)
+            if self._debug:
+                log_msg = msg_str
+                if message.get("type") == "HANDSHAKE": log_msg = "(Handshake message with API key redacted)"
+                logger.info(f"[Vitrus] Sending message: {log_msg}")
+            await self._ws.send(msg_str)
+        else:
+            logger.error("[Vitrus] WebSocket not connected or not open. Cannot send message.")
+            raise ConnectionError("WebSocket is not connected or not open.")
+
+    async def _send_message_public(self, message: Dict[str, Any]):
+        # If not connected, attempt to authenticate.
+        # self.authenticate() should robustly attempt connection and authentication.
+        # It returns True on success, False on failure, or raises an exception for critical setup issues.
+        if not self._is_connected or not self._ws_is_open():
+            if self._debug: 
+                logger.info("[Vitrus] _send_message_public: Not connected. Attempting to authenticate.")
+            
+            auth_successful = await self.authenticate() # authenticate() will try to connect.
+            
+            if not auth_successful:
+                # If authenticate() explicitly returns False, it means it tried and determined a failure
+                # (e.g., handshake failed but connection didn't immediately drop, or API key invalid).
+                # The state (_is_connected, _is_authenticated) should reflect this.
+                logger.error("[Vitrus] _send_message_public: Authentication attempt returned False. Cannot send message.")
+                raise ConnectionError("Failed to authenticate or establish a viable connection.")
+            
+            # If auth_successful is True, then self.authenticate() believes it has succeeded.
+            # self._is_connected and self._is_authenticated should be True.
+            # We still need to check the actual WebSocket state immediately before sending,
+            # as a rapid disconnection could have occurred.
+
+        # Final check: even if authentication was successful (or thought to be),
+        # is the WebSocket genuinely open RIGHT NOW?
+        if not self._is_connected or not self._ws_is_open():
+            # This path means:
+            # 1. We were initially connected, but it dropped before this check.
+            # 2. We attempted re-authentication, it *claimed* success (returned True),
+            #    but the connection is already gone (e.g., _receive_loop died and reset flags).
+            # This is the scenario matching the user's error, pointing to an unstable connection
+            # or a race where the connection drops right after the handshake.
+            logger.warning("[Vitrus] _send_message_public: Connection found to be closed immediately before sending, "
+                           "despite prior checks or authentication attempts. This may indicate an unstable connection or immediate post-handshake closure.")
+            raise ConnectionError(
+                "Connection is not active. It may have been lost immediately after being established or during an authentication attempt."
+            )
+
+        # If all checks pass, attempt to send.
+        try:
+            await self._send_message_internal_ws(message)
+        except ConnectionError as e: # Catch specific ConnectionError from _send_message_internal_ws
+            logger.error(f"[Vitrus] _send_message_public: Connection error during the actual send operation: {e}")
+            # It's possible the connection dropped at the exact moment of sending.
+            # Ensure state is fully reset if this happens.
+            if self._is_connected or self._is_authenticated: # Avoid redundant call if already closing
+                await self._close_ws_internal(graceful=False) # Reset state
+            raise # Re-raise the ConnectionError from _send_message_internal_ws
+        except Exception as e:
+            logger.error(f"[Vitrus] _send_message_public: Unexpected error during send: {type(e).__name__} - {e}")
+            if self._is_connected or self._is_authenticated: # Avoid redundant call if already closing
+                await self._close_ws_internal(graceful=False) # Reset state
+            raise # Re-raise as a generic error or wrap it
+
+
+    def _handle_message(self, message: Dict[str, Any]):
+        msg_type = message.get("type")
+        
+        # More selective logging for HANDSHAKE_RESPONSE
+        if msg_type == "HANDSHAKE_RESPONSE":
+            if self._debug: logger.info(f"[Vitrus] Handling HANDSHAKE_RESPONSE.")
+        elif self._debug:
+             logger.info(f"[Vitrus] Handling message of type: {msg_type}, RequestID: {message.get('requestId')}")
+
+
+        if msg_type == "HANDSHAKE_RESPONSE":
+            response = message # No need to cast to TypedDict for internal handling if careful
+            auth_future = self._pending_requests.pop("HANDSHAKE_RESPONSE", None)
+            if response.get("success"):
+                self._client_id = response.get("clientId", "")
+                self._redis_channel = response.get("redisChannel")
+                if self._debug: logger.info(f"[Vitrus] Handshake successful. Client ID: {self._client_id}.")
+                
+                actor_info = response.get("actorInfo")
+                if actor_info and self._current_actor_name:
+                    self._actor_metadata[self._current_actor_name] = actor_info.get("metadata", {})
+                    registered_cmds = actor_info.get("registeredCommands", [])
+                    if registered_cmds:
+                        if self._current_actor_name not in self._actor_command_signatures:
+                            self._actor_command_signatures[self._current_actor_name] = {}
+                        for cmd_def in registered_cmds: # cmd_def is dict like {"name": "cmd_name", "parameterTypes": []}
+                            self._actor_command_signatures[self._current_actor_name][cmd_def["name"]] = cmd_def["parameterTypes"]
+                
+                if auth_future and not auth_future.done(): auth_future.set_result(True)
+            else:
+                err_msg = response.get("message", "Handshake failed due to unknown server error.")
+                err_code = response.get("error_code", "UNKNOWN_ERROR")
+                logger.error(f"Handshake failed: {err_msg} (Error code: {err_code})")
+                if auth_future and not auth_future.done(): auth_future.set_exception(ConnectionError(f"Authentication failed: {err_msg} (Code: {err_code})"))
+            return
+
+        request_id = message.get("requestId")
+        pending_future = self._pending_requests.get(request_id) if request_id else None
+
+        if msg_type == "COMMAND":
+            self._handle_command_message(message) # Changed to avoid direct TypedDict casting here
+            return
+
+        if msg_type in ["RESPONSE", "WORKFLOW_RESULT", "WORKFLOW_LIST"]:
+            if pending_future:
+                self._pending_requests.pop(request_id) # Remove once we attempt to resolve
+                error = message.get("error")
+                if error:
+                    if self._debug: logger.info(f"[Vitrus] Received error for {request_id}: {error}")
+                    if not pending_future.done(): pending_future.set_exception(RuntimeError(error))
+                else:
+                    result_data = None
+                    if msg_type == "RESPONSE": result_data = message.get("result")
+                    elif msg_type == "WORKFLOW_RESULT": result_data = message.get("result")
+                    elif msg_type == "WORKFLOW_LIST": result_data = message.get("workflows", [])
+                    
+                    if self._debug: logger.info(f"[Vitrus] Received result for {request_id}: {str(result_data)[:100]}...")
+                    if not pending_future.done(): pending_future.set_result(result_data)
+            elif request_id:
+                logger.warning(f"Received message for unknown or already handled request ID: {request_id}, Type: {msg_type}")
+            return
+
+        handlers = self._message_handlers.get(msg_type, [])
+        for handler_fn in handlers:
+            try: handler_fn(message)
+            except Exception as e: logger.error(f"Error in custom message handler for type {msg_type}: {e}")
+
+    def _handle_command_message(self, command_msg_data: Dict[str,Any]):
+        actor_name = command_msg_data.get("targetActorName")
+        command_name = command_msg_data.get("commandName")
+        args = command_msg_data.get("args", [])
+        request_id = command_msg_data.get("requestId")
+        source_channel = command_msg_data.get("sourceChannel")
+
+        if not all([actor_name, command_name, request_id]): # source_channel is optional
+            logger.error(f"Received malformed COMMAND message: {command_msg_data}")
+            return
+
+        if self._debug: logger.info(f"[Vitrus] Handling command: '{command_name}' for actor '{actor_name}' with args: {args}")
+
+        actor_handlers = self._actor_command_handlers.get(actor_name, {})
+        handler = actor_handlers.get(command_name)
+
+        async def execute_and_respond_task():
+            response_payload: Dict[str, Any] = {"type": "RESPONSE", "targetChannel": source_channel or "", "requestId": request_id}
+            if not handler:
+                logger.warning(f"No handler for command '{command_name}' on actor '{actor_name}'.")
+                response_payload["error"] = f"Command '{command_name}' not found on actor '{actor_name}'."
+            else:
+                try:
+                    if inspect.iscoroutinefunction(handler): result = await handler(*args)
+                    else: # Run sync handler in thread pool executor
+                        loop = asyncio.get_running_loop()
+                        result = await loop.run_in_executor(None, handler, *args)
+                    if self._debug: logger.info(f"Command '{command_name}' on '{actor_name}' executed. Result: {str(result)[:100]}...")
+                    response_payload["result"] = result
+                except Exception as e:
+                    logger.error(f"Error executing command '{command_name}' on '{actor_name}': {type(e).__name__} - {e}", exc_info=self._debug)
+                    response_payload["error"] = str(e)
+            
+            try: # Ensure response is sent even if main connection drops during execution
+                 await self._send_message_public(response_payload) # type: ignore
+            except ConnectionError as ce:
+                 logger.error(f"ConnectionError sending response for {request_id}: {ce}")
+            except Exception as e:
+                 logger.error(f"Unexpected error sending response for {request_id}: {e}")
+
+        asyncio.create_task(execute_and_respond_task())
+
 
     def _generate_request_id(self) -> str:
-        """Generate a unique request ID"""
-        request_id = ''.join(random.choices(
-            string.ascii_lowercase + string.digits, k=10))
-        if self.debug:
-            logger.debug(f"Generated requestId: {request_id}")
+        return uuid.uuid4().hex[:13]
 
-        return request_id
+    async def authenticate(self, actor_name: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> bool:
+        if self._debug: logger.info(f"[Vitrus] Authenticating..." + (f" (as actor: {actor_name})" if actor_name else " (as agent)"))
 
-    async def authenticate(self, actor_name: str = None, metadata: Dict[str, Any] = None) -> bool:
-        """Authenticate with the API"""
-        if self.debug:
-            logger.debug(f"Initiating connection sequence..." +
-                         (f" (intended actor: {actor_name})" if actor_name else ""))
+        if actor_name and not self._world_id:
+            raise ValueError("Vitrus SDK requires a world_id to authenticate as an actor.")
 
-        # Require worldId if intending to be an actor
-        if actor_name and not self.world_id:
-            raise Exception(
-                "Vitrus SDK requires a worldId to authenticate as an actor.")
-
-        # Store actor name and metadata for use in connection
-        self.actor_name = actor_name
-        if actor_name and metadata:
-            self.actor_metadata[actor_name] = metadata
-
-        # Connect or reconnect
-        await self.connect(actor_name, metadata)
-
-        # If connected as an actor, register any pending commands
-        if self.is_authenticated and actor_name:
-            if self.debug:
-                logger.debug(f"Successfully authenticated as {actor_name}, registering pending commands")
-            await self._register_pending_commands(actor_name)
-            if self.debug:
-                if actor_name in self.actor_command_handlers:
-                    logger.debug(f"Commands registered for {actor_name}: {list(self.actor_command_handlers[actor_name].keys())}")
-                else:
-                    logger.debug(f"No commands found for {actor_name}")
-
-        return self.is_authenticated
-
-    def register_actor_command_handler(self, actor_name: str, command_name: str, handler: Callable, parameter_types: List[str] = None) -> None:
-        """Register a command handler for an actor"""
-        if self.debug:
-            logger.debug(
-                f"Registering command handler: actor={actor_name}, command={command_name}, params={parameter_types}")
-
-        # Store the command handler
-        if actor_name not in self.actor_command_handlers:
-            self.actor_command_handlers[actor_name] = {}
-        self.actor_command_handlers[actor_name][command_name] = handler
-
-        # Store the parameter types
-        if actor_name not in self.actor_command_signatures:
-            self.actor_command_signatures[actor_name] = {}
-        self.actor_command_signatures[actor_name][command_name] = parameter_types or [
-        ]
-
-    async def actor(self, name: str, options: Dict[str, Any] = None) -> Actor:
-        """Create or get an actor"""
-        if self.debug:
-            logger.debug(
-                f"Creating/getting actor handle: {name}, options={options}")
-
-        # Require worldId to create/authenticate as an actor if options are provided
-        if options is not None and not self.world_id:
-            raise Exception(
-                "Vitrus SDK requires a worldId to create/authenticate as an actor.")
-
-        # Store actor metadata immediately if provided
-        if options is not None:
-            self.actor_metadata[name] = options
-
-        actor = Actor(self, name, options if options is not None else {})
+        if self._is_authenticated and actor_name == self._current_actor_name:
+            if self._debug: logger.info(f"Already authenticated as {actor_name or 'agent'}.")
+            return True
         
-        # Track this actor for cleanup
-        self.created_actors.add(actor)
+        # If switching actor or initial auth, (re)connect
+        self._current_actor_name = actor_name # Set intent
+        if actor_name and metadata: self._actor_metadata[actor_name] = metadata
+        
+        try:
+            await self._connect(actor_name_intent=actor_name, actor_metadata_intent=metadata)
+            if self._is_authenticated and self._current_actor_name: # Successfully authenticated as specific actor
+                await self._register_pending_commands(self._current_actor_name)
+        except ConnectionError as e: # Covers connection and auth failures from _connect
+            logger.error(f"[Vitrus] Authentication failed: {e}")
+            # _connect should have reset state, but ensure here too
+            self._is_authenticated = False; self._is_connected = False
+            self._current_actor_name = None 
+            return False
+        except Exception as e: # Other unexpected errors
+            logger.error(f"[Vitrus] Unexpected error during authentication process: {type(e).__name__} - {e}")
+            await self._close_ws_internal(graceful=False) # Ensure WS is down
+            return False
 
-        # If options are provided, it implies intent to *be* this actor
-        if options is not None and (not self.is_authenticated or self.actor_name != name):
-            if self.debug:
-                logger.debug(
-                    f"Options provided for actor {name}, ensuring authentication as this actor...")
+        return self._is_authenticated
 
-            try:
-                await self.authenticate(name, options)
-                if self.debug:
-                    logger.debug(
-                        f"Successfully authenticated as actor {name}.")
 
-                # After successful auth, ensure any commands queued via .on() are registered
-                await self._register_pending_commands(name)
-            except Exception as e:
-                logger.error(f"Failed to auto-authenticate actor {name}: {e}")
-                raise
+    def register_actor_command_handler(
+        self, actor_name: str, command_name: str,
+        handler: Callable[..., Awaitable[Any]], parameter_types: List[str]
+    ):
+        if self._debug: logger.info(f"[Vitrus] Registering local command handler for actor '{actor_name}', command '{command_name}'")
+        
+        if actor_name not in self._actor_command_handlers: self._actor_command_handlers[actor_name] = {}
+        self._actor_command_handlers[actor_name][command_name] = handler
 
-        return actor
+        if actor_name not in self._actor_command_signatures: self._actor_command_signatures[actor_name] = {}
+        self._actor_command_signatures[actor_name][command_name] = parameter_types
+
+
+    async def register_command(self, actor_name: str, command_name: str, parameter_types: List[str]):
+        if not self._is_authenticated or self._current_actor_name != actor_name:
+            if self._debug: logger.info(f"[Vitrus] Queuing server registration for command '{command_name}' on actor '{actor_name}'. Will send after full auth as this actor.")
+            return # Will be handled by _register_pending_commands
+
+        if self._debug: logger.info(f"[Vitrus] Registering command with server: actor='{actor_name}', command='{command_name}'")
+        message: RegisterCommandMessage = {"type": "REGISTER_COMMAND", "actorName": actor_name, "commandName": command_name, "parameterTypes": parameter_types}
+        await self._send_message_public(message)
+
+
+    async def _register_pending_commands(self, actor_name: str):
+        if not self._is_authenticated or self._current_actor_name != actor_name: return
+        if self._debug: logger.info(f"[Vitrus] Registering any pending commands for actor '{actor_name}' with the server.")
+        
+        signatures = self._actor_command_signatures.get(actor_name, {})
+        handlers = self._actor_command_handlers.get(actor_name,{})
+
+        for cmd_name, param_types in signatures.items():
+            if cmd_name in handlers:
+                try:
+                    if self._debug: logger.info(f"Sending actual REGISTER_COMMAND for {actor_name}.{cmd_name}")
+                    # This call to register_command will now pass the auth check
+                    await self.register_command(actor_name, cmd_name, param_types)
+                except Exception as e: logger.error(f"Error registering pending command {cmd_name} for actor {actor_name}: {e}")
+
+
+    async def actor(self, name: str, options: Optional[Dict[str, Any]] = None) -> Actor:
+        if self._debug: logger.info(f"[Vitrus] actor(name='{name}', options={'provided' if options is not None else 'not provided'})")
+
+        if options is not None and not self._world_id:
+            raise ValueError("Vitrus SDK requires a world_id to create/authenticate as an actor with options.")
+
+        current_meta = self._actor_metadata.get(name, {})
+        if options is not None: current_meta.update(options); self._actor_metadata[name] = current_meta
+        
+        actor_instance = Actor(self, name, current_meta)
+
+        if options is not None: # Intent to BE this actor
+            # Authenticate if not already this actor, or if metadata changed implying re-auth might be needed
+            if not self._is_authenticated or self._current_actor_name != name:
+                 if self._debug: logger.info(f"[Vitrus] Options provided for actor '{name}'. Ensuring authentication as this actor...")
+                 await self.authenticate(name, self._actor_metadata.get(name)) # This will also call _register_pending_commands on success
+            else: # Already authenticated as this actor
+                 if self._debug: logger.info(f"Already authenticated as actor '{name}'. Ensuring commands are registered.")
+                 await self._register_pending_commands(name) # Ensure commands are up-to-date
+        return actor_instance
+
 
     def scene(self, scene_id: str) -> Scene:
-        """Get a scene"""
-        if self.debug:
-            logger.debug(f"Getting scene: {scene_id}")
-
+        if self._debug: logger.info(f"[Vitrus] Getting scene handle for ID: {scene_id}")
         return Scene(self, scene_id)
 
+
     async def run_command(self, actor_name: str, command_name: str, args: List[Any]) -> Any:
-        """Run a command on an actor"""
-        if self.debug:
-            logger.debug(
-                f"Running command: actor={actor_name}, command={command_name}, args={args}")
-
-        # Require worldId to run commands
-        if not self.world_id:
-            raise Exception(
-                "Vitrus SDK requires a worldId to run commands on actors.")
-
-        # If not authenticated yet, auto-authenticate
-        if not self.is_authenticated:
-            await self.authenticate()
+        if self._debug: logger.info(f"[Vitrus] run_command: actor='{actor_name}', command='{command_name}', args={args}")
+        if not self._world_id: raise ValueError("Vitrus SDK requires a world_id to run commands on actors.")
+        if not self._is_authenticated: await self.authenticate() # Authenticate as agent
 
         request_id = self._generate_request_id()
-        future = asyncio.Future()
+        command_msg: CommandMessage = {"type": "COMMAND", "targetActorName": actor_name, "commandName": command_name, "args": args, "requestId": request_id}
 
-        self.pending_requests[request_id] = (future, None)
-
-        command = {
-            "type": "COMMAND",
-            "targetActorName": actor_name,
-            "commandName": command_name,
-            "args": args,
-            "requestId": request_id
-        }
-
+        fut = asyncio.Future()
+        self._pending_requests[request_id] = fut
         try:
-            await self.send_message(command)
-        except Exception as e:
-            if self.debug:
-                logger.debug(f"Failed to send command: {e}")
-
-            del self.pending_requests[request_id]
+            await self._send_message_public(command_msg)
+            return await asyncio.wait_for(fut, timeout=30.0)
+        except asyncio.TimeoutError:
+            self._pending_requests.pop(request_id, None)
+            logger.error(f"Timeout waiting for response to command '{command_name}' on actor '{actor_name}' (req ID: {request_id})")
+            raise TimeoutError(f"Timeout for command '{command_name}' on '{actor_name}'")
+        except Exception as e: # Includes ConnectionError from _send_message_public if auth fails
+            self._pending_requests.pop(request_id, None)
             raise
 
-        return await future
 
-    async def workflow(self, workflow_name: str, args: Dict[str, Any] = None) -> Any:
-        """Run a workflow"""
-        if self.debug:
-            logger.debug(f"Running workflow: {workflow_name}, args={args}")
-
-        # Automatically authenticate if not authenticated yet
-        if not self.is_authenticated:
-            await self.authenticate()
+    async def workflow(self, workflow_name: str, args: Optional[Dict[str, Any]] = None) -> Any:
+        if self._debug: logger.info(f"[Vitrus] Running workflow: '{workflow_name}' with args: {args}")
+        if not self._is_authenticated: await self.authenticate()
 
         request_id = self._generate_request_id()
-        future = asyncio.Future()
+        workflow_msg: WorkflowMessage = {"type": "WORKFLOW", "workflowName": workflow_name, "args": args if args is not None else {}, "requestId": request_id}
 
-        self.pending_requests[request_id] = (future, None)
-
-        workflow_message = {
-            "type": "WORKFLOW",
-            "workflowName": workflow_name,
-            "args": args or {},
-            "requestId": request_id
-        }
-
+        fut = asyncio.Future()
+        self._pending_requests[request_id] = fut
         try:
-            await self.send_message(workflow_message)
+            await self._send_message_public(workflow_msg)
+            return await asyncio.wait_for(fut, timeout=300.0) # 5 min timeout for workflow
+        except asyncio.TimeoutError:
+            self._pending_requests.pop(request_id, None)
+            logger.error(f"Timeout waiting for result of workflow '{workflow_name}' (req ID: {request_id})")
+            raise TimeoutError(f"Timeout for workflow '{workflow_name}'")
         except Exception as e:
-            if self.debug:
-                logger.debug(f"Failed to send workflow: {e}")
-
-            del self.pending_requests[request_id]
+            self._pending_requests.pop(request_id, None)
             raise
 
-        return await future
+    async def list_workflows(self) -> List[WorkflowDefinition]:
+        if self._debug: logger.info("[Vitrus] Requesting list of available workflows.")
+        if not self._is_authenticated: await self.authenticate()
 
-    async def upload_image(self, image: Any, filename: str = "image") -> str:
-        """Upload an image"""
-        if self.debug:
-            logger.debug(f"Uploading image: {filename}")
+        request_id = self._generate_request_id()
+        list_msg: ListWorkflowsMessage = {"type": "LIST_WORKFLOWS", "requestId": request_id}
 
-        # Implementation would handle image uploads
-        # For now, just return a mock URL
-        return f"https://vitrus.io/images/{filename}"
+        fut = asyncio.Future()
+        self._pending_requests[request_id] = fut
+        try:
+            await self._send_message_public(list_msg)
+            return await asyncio.wait_for(fut, timeout=30.0)
+        except asyncio.TimeoutError:
+            self._pending_requests.pop(request_id, None)
+            logger.error(f"Timeout waiting for workflow list (req ID: {request_id})")
+            raise TimeoutError("Timeout waiting for workflow list")
+        except Exception as e:
+            self._pending_requests.pop(request_id, None)
+            raise
 
-    async def add_record(self, data: Dict[str, Any], name: str = None) -> str:
-        """Add a record"""
-        if self.debug:
-            logger.debug(f"Adding record: data={data}, name={name}")
+    async def upload_image(self, image_data: bytes, filename: str = "image.png") -> str:
+        if self._debug: logger.info(f"[Vitrus] Mock uploading image: {filename} (size: {len(image_data)} bytes)")
+        logger.warning("Vitrus.upload_image is a mock implementation.")
+        return f"https://vitrus.io/images/{filename}" # Mock URL
 
-        # Implementation would store the record
-        # For now, just return success
+    async def add_record(self, data: Dict[str, Any], name: Optional[str] = None) -> str:
+        if self._debug: logger.info(f"[Vitrus] Mock adding record: {name or 'untitled'} with data: {data}")
+        logger.warning("Vitrus.add_record is a mock implementation.")
         return name or self._generate_request_id()
 
-    async def list_workflows(self) -> List[Dict[str, Any]]:
-        """List available workflows on the server"""
-        if self.debug:
-            logger.debug("Requesting workflow list with definitions...")
+    @property
+    def is_authenticated(self) -> bool: return self._is_authenticated
+    @property
+    def actor_name(self) -> Optional[str]: return self._current_actor_name
+    @property
+    def client_id(self) -> str: return self._client_id
+    @property
+    def debug(self) -> bool: return self._debug
 
-        # Automatically authenticate if not authenticated yet
-        if not self.is_authenticated:
-            await self.authenticate()
+    def disconnect_if_actor(self, actor_name_to_disconnect: str) -> None:
+        if self._current_actor_name == actor_name_to_disconnect and self._is_authenticated:
+            if self._ws_is_open():
+                if self._debug: logger.info(f"[Vitrus] Actor '{actor_name_to_disconnect}' is requesting SDK disconnect.")
+                asyncio.create_task(self._close_ws_internal(graceful=True)) # Schedule close
+            else: # Authenticated as actor, but WS not open.
+                 if self._debug: logger.info(f"[Vitrus] disconnect_if_actor: WS for '{actor_name_to_disconnect}' not open, but was auth'd. Cleaning state.")
+                 self._is_authenticated = False; self._is_connected = False; self._current_actor_name = None
+        elif self._debug:
+            logger.info(f"[Vitrus] disconnect_if_actor: SDK not connected as '{actor_name_to_disconnect}' (currently: {self._current_actor_name or 'agent/none'}). No action.")
 
-        request_id = self._generate_request_id()
-        future = asyncio.Future()
+    async def close(self) -> None:
+        """Gracefully closes the WebSocket connection and cleans up resources."""
+        if self._debug: logger.info("[Vitrus] Initiating graceful shutdown of SDK instance.")
+        await self._close_ws_internal(graceful=True)
 
-        self.pending_requests[request_id] = (future, None)
-
-        message = {
-            "type": "LIST_WORKFLOWS",
-            "requestId": request_id
-        }
-
+    def _ws_is_open(self) -> bool:
+        """
+        Helper to check if the websocket connection is open.
+        Compatible with different websockets library versions.
+        """
+        if self._ws is None:
+            return False
+        
+        # Try different approaches based on websockets library version
         try:
-            await self.send_message(message)
-        except Exception as e:
-            if self.debug:
-                logger.debug(f"Failed to send LIST_WORKFLOWS message: {e}")
-
-            del self.pending_requests[request_id]
-            raise
-
-        return await future
-
-    async def _register_pending_commands(self, actor_name: str) -> None:
-        """Register commands that might have been added via actor.on() before authentication"""
-        if actor_name not in self.actor_command_handlers or actor_name not in self.actor_command_signatures:
-            if self.debug:
-                logger.debug(f"No pending commands to register for actor {actor_name}")
-            return
-
-        handlers = self.actor_command_handlers[actor_name]
-        signatures = self.actor_command_signatures[actor_name]
-
-        if self.debug:
-            logger.debug(
-                f"Registering pending commands for actor {actor_name}: {list(handlers.keys())}")
-
-        for command_name, parameter_types in signatures.items():
-            if command_name in handlers:  # Ensure handler still exists
-                try:
-                    if self.debug:
-                        logger.debug(f"Registering command {command_name} with server")
-                    await self.register_command(actor_name, command_name, parameter_types)
-                except Exception as e:
-                    logger.error(
-                        f"Error registering pending command {command_name} for actor {actor_name}: {e}")
-                
-        # Double-check registration was successful
-        if self.debug:
-            logger.debug(f"Command registration complete. Registered commands for {actor_name}: {list(handlers.keys())}")
-
-    def disconnect_if_actor(self, actor_name: str) -> None:
-        """Disconnects the WebSocket if the SDK is currently authenticated as the specified actor.
-        Also unregisters any commands for this actor."""
-        if self.actor_name == actor_name and self.is_authenticated and self.ws and self.connected:
-            if self.debug:
-                logger.debug(
-                    f"Actor '{actor_name}' is disconnecting and unregistering commands.")
-            
-            # Unregister commands from server (if needed by your server implementation)
-            try:
-                # Clear local command references
-                if actor_name in self.actor_command_handlers:
-                    self.actor_command_handlers.pop(actor_name, None)
-                
-                if actor_name in self.actor_command_signatures:
-                    self.actor_command_signatures.pop(actor_name, None)
-                
-                if actor_name in self.actor_metadata:
-                    self.actor_metadata.pop(actor_name, None)
-                    
-                # Close the connection - this will trigger the websocket close handler
-                asyncio.create_task(self.ws.close())
-                # The message handler will manage further state changes
-            except Exception as e:
-                if self.debug:
-                    logger.debug(f"Error during actor disconnection: {e}")
-        elif self.debug:
-            if self.actor_name != actor_name:
-                logger.debug(
-                    f"disconnectIfActor: SDK not connected as '{actor_name}' (currently: {self.actor_name or 'agent/none'}). No action taken.")
-            elif not self.is_authenticated:
-                logger.debug(
-                    f"disconnectIfActor: SDK not authenticated as '{actor_name}'. No action taken.")
-            else:
-                logger.debug(
-                    f"disconnectIfActor: WebSocket for '{actor_name}' not open or available. No action taken.")
-
-    async def disconnect(self) -> None:
-        """Disconnect from the WebSocket server and clean up all resources"""
-        if self.debug:
-            logger.debug("Disconnecting from Vitrus server and cleaning resources")
+            # For newer websockets versions (15.x+) - check state
+            if hasattr(self._ws, 'state'):
+                from websockets.protocol import State
+                return self._ws.state == State.OPEN
+        except (ImportError, AttributeError):
+            pass
         
-        # Disconnect if connected as an actor
-        if self.actor_name and self.is_authenticated:
-            self.disconnect_if_actor(self.actor_name)
-        # Otherwise just close the connection if it's open
-        elif self.connected and self.ws:
-            try:
-                await self.ws.close()
-            except Exception as e:
-                if self.debug:
-                    logger.debug(f"Error during WebSocket disconnection: {e}")
+        try:
+            # For legacy versions - check open property
+            if hasattr(self._ws, 'open'):
+                return self._ws.open
+        except AttributeError:
+            pass
         
-        # Clean up resources
-        self.connected = False
-        self.is_authenticated = False
-        self.client_id = ""
-        self.redis_channel = None
+        try:
+            # For some versions - check closed property
+            if hasattr(self._ws, 'closed'):
+                return not self._ws.closed
+        except AttributeError:
+            pass
         
-        # Clear any pending requests
-        for request_id, (future, _) in list(self.pending_requests.items()):
-            if not future.done():
-                future.set_exception(Exception("Disconnected by user"))
-        self.pending_requests.clear()
-        
-        if self.debug:
-            logger.debug("Disconnection complete")
-
-    async def _cleanup(self) -> None:
-        """Clean up resources when the SDK is being destroyed"""
-        if self.debug:
-            logger.debug("Cleaning up Vitrus resources")
-        
-        # Clean up all created actors
-        if self.created_actors:
-            if self.debug:
-                logger.debug(f"Cleaning up {len(self.created_actors)} actors")
-            
-            # Make a copy since the set might change during iteration
-            for actor in list(self.created_actors):
-                try:
-                    if self.debug:
-                        logger.debug(f"Disconnecting actor: {actor.name}")
-                    if self.actor_name == actor.name and self.is_authenticated:
-                        self.disconnect_if_actor(actor.name)
-                except Exception as e:
-                    if self.debug:
-                        logger.debug(f"Error during actor cleanup: {e}")
-        
-        # Clear the actor set
-        self.created_actors.clear()
-        
-        # Disconnect from the server
-        await self.disconnect()
-        
-        # Remove this instance from the global set
-        _vitrus_instances.discard(self)
-        
-        if self.debug:
-            logger.debug("Vitrus resources cleaned up")
+        # Fallback - assume open if websocket exists and no explicit close method available
+        return True
