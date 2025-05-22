@@ -772,7 +772,13 @@ class Vitrus:
 
     async def workflow(self, workflow_name: str, args: Optional[Dict[str, Any]] = None) -> Any:
         if self._debug: logger.info(f"[Vitrus] Running workflow: '{workflow_name}' with args: {args}")
-        if not self._is_authenticated: await self.authenticate()
+        # Preserve existing authentication state - don't force re-auth as agent
+        if not self._is_authenticated: 
+            # If we have a current actor name, re-authenticate as that actor
+            if self._current_actor_name:
+                await self.authenticate(self._current_actor_name, self._actor_metadata.get(self._current_actor_name))
+            else:
+                await self.authenticate()  # Authenticate as agent only if no actor context
 
         request_id = self._generate_request_id()
         workflow_msg: WorkflowMessage = {"type": "WORKFLOW", "workflowName": workflow_name, "args": args if args is not None else {}, "requestId": request_id}
@@ -792,7 +798,13 @@ class Vitrus:
 
     async def list_workflows(self) -> List[WorkflowDefinition]:
         if self._debug: logger.info("[Vitrus] Requesting list of available workflows.")
-        if not self._is_authenticated: await self.authenticate()
+        # Preserve existing authentication state - don't force re-auth as agent
+        if not self._is_authenticated:
+            # If we have a current actor name, re-authenticate as that actor
+            if self._current_actor_name:
+                await self.authenticate(self._current_actor_name, self._actor_metadata.get(self._current_actor_name))
+            else:
+                await self.authenticate()  # Authenticate as agent only if no actor context
 
         request_id = self._generate_request_id()
         list_msg: ListWorkflowsMessage = {"type": "LIST_WORKFLOWS", "requestId": request_id}
