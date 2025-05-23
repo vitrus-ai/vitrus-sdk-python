@@ -12,7 +12,7 @@ For detailed documentation and more examples access [Vitrus Docs](https://vitrus
 pip install vitrus
 
 # Or install from source
-pip install git+https://github.com/vitrus/vitrus-sdk-python.git
+pip install git+https://github.com/vitrus-ai/vitrus-sdk-python.git
 ```
 
 ## Authentication
