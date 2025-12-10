@@ -13,7 +13,7 @@ pip install git+https://github.com/vitrus-ai/vitrus-sdk-python.git
 
 ## Authentication
 
-[Get an API Key](https://app.vitrus.ai)
+[How to get an API Key](https://vitrus.com)
 
 ```python
 import asyncio
