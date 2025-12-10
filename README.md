@@ -3,8 +3,6 @@
 A Python client for multi Agent-World-Actor orchestration, with easy-to-use spatial perception _Workflows_.
 For detailed documentation and more examples access [Vitrus Docs](https://vitrus.gitbook.io/docs/concepts).
 
-💡 Tip: If anything takes more than 2 minutes to setup, ask in our [Discord channel](https://discord.gg/Xd5f6WSh).
-
 ## Installation
 Install from source
 ```bash
