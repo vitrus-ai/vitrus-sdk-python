@@ -6,9 +6,8 @@ For detailed documentation and more examples access [Vitrus Docs](https://vitrus
 💡 Tip: If anything takes more than 2 minutes to setup, ask in our [Discord channel](https://discord.gg/Xd5f6WSh).
 
 ## Installation
-
+Install from source
 ```bash
-# Install from source
 pip install git+https://github.com/vitrus-ai/vitrus-sdk-python.git
 ```
 
