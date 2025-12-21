@@ -1,4 +1,5 @@
 import asyncio
+import atexit
 import json
 import logging
 import uuid
@@ -29,6 +30,34 @@ logger = logging.getLogger(__name__)
 # --- SDK Version ---
 SDK_VERSION = "0.1.0"  # Placeholder, similar to TS fallback
 DEFAULT_BASE_URL = "wss://vitrus-dao.onrender.com"
+
+# Best-effort global cleanup for SDK instances (prevents lingering actor/agent sockets).
+_SDK_INSTANCES: "set[Vitrus]" = set()  # type: ignore[name-defined]
+_ATEXIT_INSTALLED = False
+
+def _install_atexit_once():
+    global _ATEXIT_INSTALLED
+    if _ATEXIT_INSTALLED:
+        return
+    _ATEXIT_INSTALLED = True
+
+    def _cleanup():
+        for inst in list(_SDK_INSTANCES):
+            try:
+                # Try to close gracefully. If no loop, run a temporary loop.
+                if hasattr(inst, "_ws") and getattr(inst, "_ws") is not None:
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            asyncio.create_task(inst.close())
+                        else:
+                            loop.run_until_complete(inst.close())
+                    except RuntimeError:
+                        asyncio.run(inst.close())
+            except Exception:
+                pass
+
+    atexit.register(_cleanup)
 
 # --- Message Type Definitions (using TypedDict for clarity) ---
 # In Python, we'd typically use dataclasses or TypedDict for these.
@@ -74,6 +103,24 @@ class ResponseMessage(TypedDict):
     requestId: str
     result: Optional[Any]
     error: Optional[str]
+
+class ActorBroadcastEmitMessage(TypedDict, total=False):
+    type: Literal['BROADCAST', 'EVENT']  # EVENT kept as legacy alias
+    broadcastName: str
+    eventName: str  # legacy alias
+    args: Any
+    worldId: Optional[str]
+
+
+class ActorBroadcastMessage(TypedDict):
+    type: Literal['ACTOR_BROADCAST', 'ACTOR_EVENT']  # ACTOR_EVENT kept as legacy alias
+    actorName: str
+    actorId: Optional[str]
+    worldId: str
+    broadcastName: Optional[str]
+    eventName: Optional[str]  # legacy alias
+    args: Any
+    timestamp: str
 
 
 class RegisterCommandMessage(TypedDict):
@@ -199,6 +246,34 @@ class Actor:
         """
         return await self._vitrus.run_command(self._name, command_name, list(args))
 
+    def listen(self, event_name: str, handler: Callable[[Any], Any]) -> "Actor":
+        """
+        Listen for ad-hoc broadcasts emitted by this actor (agent-side handle).
+        """
+        self._vitrus.register_actor_broadcast_handler(self._name, event_name, handler)
+        if not self._vitrus.is_authenticated:
+            try:
+                asyncio.create_task(self._vitrus.authenticate())
+            except RuntimeError:
+                # No running loop; user will need to call authenticate() manually.
+                pass
+        return self
+
+    def broadcast(self, broadcast_name: str, args: Any) -> None:
+        """
+        Emit an ad-hoc broadcast from this actor to agents in the same world.
+        Intended to be called while authenticated as this actor.
+        """
+        try:
+            asyncio.create_task(self._vitrus.send_broadcast(self._name, broadcast_name, args))
+        except RuntimeError:
+            # No running loop; user should call `await vitrus.send_broadcast(...)`.
+            pass
+
+    # Legacy alias
+    def event(self, event_name: str, args: Any) -> None:
+        self.broadcast(event_name, args)
+
     @property
     def name(self) -> str:
         return self._name
@@ -260,6 +335,7 @@ class Vitrus:
     _actor_command_handlers: Dict[str, Dict[str, Callable[..., Awaitable[Any]]]]
     _actor_command_signatures: Dict[str, Dict[str, List[str]]]
     _actor_metadata: Dict[str, Any]
+    _actor_event_handlers: Dict[str, Dict[str, List[Callable[[Any], Any]]]]
     _base_url: str
     _debug: bool
     _current_actor_name: Optional[str]
@@ -283,6 +359,7 @@ class Vitrus:
         self._actor_command_handlers = {}
         self._actor_command_signatures = {}
         self._actor_metadata = {}
+        self._actor_event_handlers = {}
         self._current_actor_name = None
         self._connection_lock = asyncio.Lock()
         self._receive_task = None
@@ -300,6 +377,10 @@ class Vitrus:
                 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
             else:
                  logger.setLevel(logging.WARNING)
+
+        global _SDK_INSTANCES
+        _SDK_INSTANCES.add(self)
+        _install_atexit_once()
 
 
     async def _connect(self, actor_name_intent: Optional[str] = None, actor_metadata_intent: Optional[Dict[str, Any]] = None) -> None:
@@ -573,6 +654,10 @@ class Vitrus:
                 if auth_future and not auth_future.done(): auth_future.set_exception(ConnectionError(f"Authentication failed: {err_msg} (Code: {err_code})"))
             return
 
+        if msg_type in ("ACTOR_BROADCAST", "ACTOR_EVENT"):
+            self._dispatch_actor_broadcast(message)  # type: ignore[arg-type]
+            return
+
         request_id = message.get("requestId")
         pending_future = self._pending_requests.get(request_id) if request_id else None
 
@@ -603,6 +688,25 @@ class Vitrus:
         for handler_fn in handlers:
             try: handler_fn(message)
             except Exception as e: logger.error(f"Error in custom message handler for type {msg_type}: {e}")
+
+    def _dispatch_actor_broadcast(self, message: Dict[str, Any]) -> None:
+        actor_name = message.get("actorName")
+        event_name = message.get("broadcastName") or message.get("eventName")
+        args = message.get("args")
+
+        if not isinstance(actor_name, str) or not isinstance(event_name, str):
+            if self._debug: logger.info(f"[Vitrus] Received malformed ACTOR_EVENT: {message}")
+            return
+
+        handlers = self._actor_event_handlers.get(actor_name, {}).get(event_name, [])
+        for handler in handlers:
+            try:
+                if inspect.iscoroutinefunction(handler):
+                    asyncio.create_task(handler(args))  # type: ignore[misc]
+                else:
+                    handler(args)
+            except Exception as e:
+                logger.error(f"Error in actor event handler for {actor_name}.{event_name}: {e}")
 
     def _handle_command_message(self, command_msg_data: Dict[str,Any]):
         actor_name = command_msg_data.get("targetActorName")
@@ -693,6 +797,29 @@ class Vitrus:
 
         if actor_name not in self._actor_command_signatures: self._actor_command_signatures[actor_name] = {}
         self._actor_command_signatures[actor_name][command_name] = parameter_types
+
+    def register_actor_broadcast_handler(self, actor_name: str, broadcast_name: str, handler: Callable[[Any], Any]) -> None:
+        if actor_name not in self._actor_event_handlers:
+            self._actor_event_handlers[actor_name] = {}
+        if broadcast_name not in self._actor_event_handlers[actor_name]:
+            self._actor_event_handlers[actor_name][broadcast_name] = []
+        self._actor_event_handlers[actor_name][broadcast_name].append(handler)
+
+    # Legacy alias
+    def register_actor_event_handler(self, actor_name: str, event_name: str, handler: Callable[[Any], Any]) -> None:
+        self.register_actor_broadcast_handler(actor_name, event_name, handler)
+
+    async def send_broadcast(self, actor_name: str, broadcast_name: str, args: Any) -> None:
+        if not self._is_authenticated or self._current_actor_name != actor_name:
+            if self._debug:
+                logger.info(f"[Vitrus] Not broadcasting '{broadcast_name}' - not authenticated as actor '{actor_name}'.")
+            return
+        msg: ActorBroadcastEmitMessage = {"type": "BROADCAST", "broadcastName": broadcast_name, "eventName": broadcast_name, "args": args}
+        await self._send_message_public(msg)  # type: ignore[arg-type]
+
+    # Legacy alias
+    async def send_event(self, actor_name: str, event_name: str, args: Any) -> None:
+        await self.send_broadcast(actor_name, event_name, args)
 
 
     async def register_command(self, actor_name: str, command_name: str, parameter_types: List[str]):
@@ -856,6 +983,7 @@ class Vitrus:
         """Gracefully closes the WebSocket connection and cleans up resources."""
         if self._debug: logger.info("[Vitrus] Initiating graceful shutdown of SDK instance.")
         await self._close_ws_internal(graceful=True)
+        _SDK_INSTANCES.discard(self)
 
     def _ws_is_open(self) -> bool:
         """
