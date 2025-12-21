@@ -32,7 +32,9 @@ SDK_VERSION = "0.1.0"  # Placeholder, similar to TS fallback
 DEFAULT_BASE_URL = "wss://vitrus-dao.onrender.com"
 
 # Best-effort global cleanup for SDK instances (prevents lingering actor/agent sockets).
-_SDK_INSTANCES: "set[Vitrus]" = set()  # type: ignore[name-defined]
+# NOTE: do not reference `Vitrus` in runtime-evaluated annotations here (module-level annotations
+# are evaluated at import time on Python 3.9 unless `from __future__ import annotations`).
+_SDK_INSTANCES = set()
 _ATEXIT_INSTALLED = False
 
 def _install_atexit_once():
