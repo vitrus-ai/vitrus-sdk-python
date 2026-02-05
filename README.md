@@ -12,6 +12,10 @@ For detailed documentation and more examples access [Vitrus Docs](https://vitrus
 pip install git+https://github.com/vitrus-ai/vitrus-sdk-python.git
 ```
 
+## Communication
+
+Agent–actor traffic (commands, responses, broadcasts, events) uses **Zenoh** as the core transport. The client connects to the DAO over WebSocket once for handshake (API key, world ID) and receives `routerUrl`; all further communication uses Zenoh. The DAO must be started with `ZENOH_ROUTER_URL` set so the handshake returns the router URL.
+
 ## Authentication
 
 [Get an API Key](https://app.vitrus.ai)

@@ -21,5 +21,6 @@ setup(
     python_requires=">=3.7",
     install_requires=[
         "websockets>=10.0",
+        "zenoh",
     ],
 )

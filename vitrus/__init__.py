@@ -18,10 +18,29 @@ from typing import (
 )
 from enum import Enum
 
+"""
+Vitrus SDK (Python).
+
+Client for the Vitrus DAO. Actor/Agent communication with workflow orchestration.
+
+Communication: Dual transport (Zenoh + WebSocket). Handshake over WebSocket obtains clientId
+and optional routerUrl. When routerUrl is set, commands/responses and actor broadcasts/events
+use Zenoh; the Python client also sends/receives over WebSocket so it works with a WebSocket-only
+DAO and with TypeScript actors. actor.on("action", fn) can be invoked via either channel;
+responses go back on the same channel. actor.broadcast() sends on both Zenoh and WebSocket when
+both are available.
+"""
+
 # Using websockets library for Python
 import websockets
 from websockets.client import WebSocketClientProtocol
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, ConnectionClosedOK
+
+try:
+    import zenoh  # type: ignore
+    ZENOH_AVAILABLE = True
+except Exception:  # pragma: no cover - optional dependency
+    ZENOH_AVAILABLE = False
 
 # Setup basic logging
 logger = logging.getLogger(__name__)
@@ -31,6 +50,7 @@ SDK_VERSION = "0.1.0"  # Placeholder, similar to TS fallback
 DEFAULT_BASE_URL = "wss://vitrus-dao.onrender.com"
 
 # --- Message Type Definitions (using TypedDict for clarity) ---
+# COMMAND, RESPONSE, ACTOR_BROADCAST, ACTOR_EVENT can come via Zenoh or WebSocket (dual transport).
 # In Python, we'd typically use dataclasses or TypedDict for these.
 # For simplicity matching the TS interfaces, TypedDict is closer.
 try:
@@ -40,12 +60,18 @@ except ImportError:
     from typing_extensions import TypedDict, Literal
 
 
-class HandshakeMessage(TypedDict):
+ClientType = Literal['actor', 'agent', 'unknown']
+
+class HandshakeMessage(TypedDict, total=False):
     type: Literal['HANDSHAKE']
-    apiKey: str
+    clientType: ClientType
     worldId: Optional[str]
+    apiKey: str
     actorName: Optional[str]
+    actorId: Optional[str]
+    registeredCommands: Optional[List[Dict[str, Any]]]
     metadata: Optional[Any]
+    agentName: Optional[str]
 
 
 class HandshakeResponseMessage(TypedDict):
@@ -54,24 +80,32 @@ class HandshakeResponseMessage(TypedDict):
     clientId: str
     userId: Optional[str]
     error_code: Optional[str]
-    redisChannel: Optional[str]
     message: Optional[str]
+    routerUrl: Optional[str]
+    actorId: Optional[str]
+    serverIp: Optional[str]
+    worldExists: Optional[bool]
     actorInfo: Optional[Dict[str, Any]] # Contains metadata and registeredCommands
 
 
 class CommandMessage(TypedDict):
     type: Literal['COMMAND']
-    targetActorName: str
+    senderType: ClientType
+    senderName: str
+    targetType: Union[ClientType, Literal['broadcast']]
+    targetName: Optional[str]
     commandName: str
     args: List[Any]
     requestId: str
     sourceChannel: Optional[str]
+    worldId: Optional[str]
 
 
 class ResponseMessage(TypedDict):
     type: Literal['RESPONSE']
     targetChannel: str
     requestId: str
+    commandId: str
     result: Optional[Any]
     error: Optional[str]
 
@@ -83,8 +117,8 @@ class RegisterCommandMessage(TypedDict):
     parameterTypes: List[str]
 
 
-class WorkflowMessage(TypedDict):
-    type: Literal['WORKFLOW']
+class WorkflowInvocationMessage(TypedDict):
+    type: Literal['WORKFLOW_INVOCATION']
     workflowName: str
     args: Any
     requestId: str
@@ -130,6 +164,34 @@ class WorkflowListMessage(TypedDict):
     error: Optional[str]
 
 
+# --- Get Actor Info (agent requests Supabase-backed actor record) ---
+class GetActorInfoMessage(TypedDict):
+    type: Literal['GET_ACTOR_INFO']
+    worldId: str
+    actorName: str
+    requestId: str
+
+
+class ActorRecord(TypedDict, total=False):
+    """Supabase-backed actor record (id, info, device_id, state, etc.)."""
+    id: str
+    name: str
+    world_id: str
+    info: Any
+    device_id: Optional[str]
+    state: str
+    created_at: str
+    updated_at: str
+    registeredCommands: Optional[List[Dict[str, Any]]]
+
+
+class GetActorInfoResponseMessage(TypedDict, total=False):
+    type: Literal['GET_ACTOR_INFO_RESPONSE']
+    requestId: str
+    actor: Optional[ActorRecord]
+    error: Optional[str]
+
+
 # --- Utility for extracting parameter types ---
 def get_parameter_types(func: Callable) -> List[str]:
     """
@@ -170,13 +232,24 @@ class Actor:
     _vitrus: "Vitrus"
     _name: str
     _metadata: Dict[str, Any]
+    _record: Optional[ActorRecord]
     # Command handlers are stored in Vitrus instance: _vitrus._actor_command_handlers
 
-    def __init__(self, vitrus_client: "Vitrus", name: str, metadata: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        vitrus_client: "Vitrus",
+        name: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        record: Optional[ActorRecord] = None,
+    ):
         self._vitrus = vitrus_client
         self._name = name
-        self._metadata = metadata if metadata is not None else {}
-        # _command_handlers are stored in the Vitrus client instance to keep Actor light
+        base_meta = metadata if metadata is not None else {}
+        if record and record.get("info"):
+            self._metadata = {**record.get("info", {}), **base_meta}
+        else:
+            self._metadata = base_meta
+        self._record = record
 
     def on(self, command_name: str, handler: Callable[..., Awaitable[Any]]):
         """
@@ -199,6 +272,26 @@ class Actor:
         """
         return await self._vitrus.run_command(self._name, command_name, list(args))
 
+    async def broadcast(self, event_name: str, data: Any) -> None:
+        """
+        Broadcast an event to all agents subscribed to this actor's event (actor-side only).
+        Call when connected as this actor.
+        """
+        await self._vitrus.broadcast_actor_event(self._name, event_name, data)
+
+    def event(self, event_name: str, callback: Callable[[Any], None]) -> "Actor":
+        """
+        Subscribe to this actor's broadcast events (agent-side). Callback receives event data.
+        """
+        self._vitrus.subscribe_actor_event(self._name, event_name, callback)
+        return self
+
+    def listen(self, event_name: str, callback: Callable[[Any], None]) -> "Actor":
+        """
+        Alias for event(). Subscribe to this actor's broadcasts (agent-side). e.g. actor.listen('telemetry', lambda data: ...)
+        """
+        return self.event(event_name, callback)
+
     @property
     def name(self) -> str:
         return self._name
@@ -206,6 +299,33 @@ class Actor:
     @property
     def metadata(self) -> Dict[str, Any]:
         return self._metadata
+
+    @property
+    def id(self) -> Optional[str]:
+        """Actor ID from Supabase (when fetched via actor(name) as agent)."""
+        return self._record.get("id") if self._record else None
+
+    @property
+    def info(self) -> Any:
+        """Actor info/metadata from Supabase."""
+        return (self._record.get("info") if self._record else None) or self._metadata
+
+    @property
+    def device_id(self) -> Optional[str]:
+        """Associated device ID from Supabase."""
+        return self._record.get("device_id") if self._record else None
+
+    @property
+    def state(self) -> Optional[str]:
+        """Actor state from Supabase (e.g. connected, disconnected)."""
+        return self._record.get("state") if self._record else None
+
+    @property
+    def registered_commands(
+        self,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Registered commands from DAO/Supabase."""
+        return self._record.get("registeredCommands") if self._record else None
 
     def update_metadata(self, new_metadata: Dict[str, Any]):
         self._metadata.update(new_metadata)
@@ -249,8 +369,10 @@ class Scene:
 
 # --- Main Vitrus Class ---
 class Vitrus:
+    """Vitrus client. Connects via WebSocket for handshake (get routerUrl), then uses Zenoh for all agent/actor traffic."""
     _ws: Optional[WebSocketClientProtocol]
     _api_key: str
+    _agent_name: Optional[str]
     _world_id: Optional[str]
     _client_id: str
     _is_connected: bool
@@ -265,11 +387,26 @@ class Vitrus:
     _current_actor_name: Optional[str]
     _connection_lock: asyncio.Lock
     _receive_task: Optional[asyncio.Task]
-    _redis_channel: Optional[str]
+    _router_url: Optional[str]
+    _server_ip: Optional[str]
+    _world_exists: Optional[bool]
+    _zenoh_session: Optional[Any]
+    _zenoh_actor_subscriber: Optional[Any]
+    _zenoh_agent_response_subscriber: Optional[Any]
+    _zenoh_event_subscribers: Dict[str, Any]  # key "actor_name:event_name" -> subscriber
+    _actor_event_listeners: Dict[str, Dict[str, List[Callable[[Any], None]]]]  # actor_name -> event_name -> callbacks
+    _main_loop: Optional[asyncio.AbstractEventLoop]  # set when Zenoh session is created (async context); used to schedule work from Zenoh callbacks
 
-
-    def __init__(self, api_key: str, world: Optional[str] = None, base_url: str = DEFAULT_BASE_URL, debug: bool = False):
+    def __init__(
+        self,
+        api_key: str,
+        world: Optional[str] = None,
+        base_url: str = DEFAULT_BASE_URL,
+        debug: bool = False,
+        agent_name: Optional[str] = None
+    ):
         self._api_key = api_key
+        self._agent_name = agent_name
         self._world_id = world
         self._base_url = base_url
         self._debug = debug
@@ -286,7 +423,17 @@ class Vitrus:
         self._current_actor_name = None
         self._connection_lock = asyncio.Lock()
         self._receive_task = None
-        self._redis_channel = None
+        self._router_url = None
+        self._server_ip = None
+        self._world_exists = None
+        self._zenoh_session = None
+        self._zenoh_actor_subscriber = None
+        self._zenoh_agent_response_subscriber = None
+        self._zenoh_event_subscribers = {}
+        self._actor_event_listeners = {}
+        self._main_loop = None
+        self._processed_request_ids: set = set()  # dedupe COMMAND by requestId when agent sends to both Zenoh and WS
+        self._max_processed_request_ids = 200
 
         if self._debug:
             # Ensure logger is configured to show INFO level for debug mode
@@ -294,7 +441,7 @@ class Vitrus:
                 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
             else: # If handlers exist, just set level for this logger
                 logger.setLevel(logging.INFO)
-            logger.info(f"[Vitrus v{SDK_VERSION}] Initializing with options: api_key=****, world={world}, base_url={base_url}, debug={debug}")
+            logger.info(f"[Vitrus v{SDK_VERSION}] Initializing with options: api_key=****, agent_name={agent_name}, world={world}, base_url={base_url}, debug={debug}")
         else:
             if not logger.handlers:
                 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -318,10 +465,11 @@ class Vitrus:
             if self._current_actor_name and actor_metadata_intent:
                 self._actor_metadata[self._current_actor_name] = actor_metadata_intent
 
-            query_params = f"?apiKey={self._api_key}"
+            params: List[str] = [f"apiKey={self._api_key}"]
             if self._world_id:
-                query_params += f"&worldId={self._world_id}"
-            
+                params.append(f"worldId={self._world_id}")
+
+            query_params = f"?{'&'.join(params)}" if params else ""
             full_url = f"{self._base_url}{query_params}"
 
             if self._debug:
@@ -337,10 +485,13 @@ class Vitrus:
 
                 handshake_msg: HandshakeMessage = {
                     "type": "HANDSHAKE",
-                    "apiKey": self._api_key,
+                    "clientType": "actor" if self._current_actor_name else "agent",
                     "worldId": self._world_id,
+                    "apiKey": self._api_key,
                     "actorName": self._current_actor_name,
+                    "registeredCommands": self._get_registered_commands(self._current_actor_name) if self._current_actor_name else None,
                     "metadata": self._actor_metadata.get(self._current_actor_name) if self._current_actor_name else None,
+                    "agentName": self._agent_name
                 }
                 await self._send_message_internal_ws(handshake_msg)
 
@@ -417,6 +568,34 @@ class Vitrus:
                 if self._debug: logger.info("[Vitrus] WebSocket connection closed.")
             except Exception as e:
                 if self._debug: logger.warning(f"[Vitrus] Error while closing WebSocket: {type(e).__name__} - {e}")
+
+        if self._zenoh_actor_subscriber:
+            try:
+                self._zenoh_actor_subscriber.undeclare()
+            except Exception:
+                pass
+            self._zenoh_actor_subscriber = None
+
+        if self._zenoh_agent_response_subscriber:
+            try:
+                self._zenoh_agent_response_subscriber.undeclare()
+            except Exception:
+                pass
+            self._zenoh_agent_response_subscriber = None
+
+        for sub in self._zenoh_event_subscribers.values():
+            try:
+                sub.undeclare()
+            except Exception:
+                pass
+        self._zenoh_event_subscribers.clear()
+
+        if self._zenoh_session:
+            try:
+                self._zenoh_session.close()
+            except Exception:
+                pass
+            self._zenoh_session = None
         
         self._ws = None
         self._is_connected = False
@@ -537,6 +716,118 @@ class Vitrus:
             raise # Re-raise as a generic error or wrap it
 
 
+    async def _ensure_zenoh_session(self) -> bool:
+        if not ZENOH_AVAILABLE or not self._router_url:
+            return False
+        if self._zenoh_session:
+            return True
+        try:
+            config = zenoh.Config()
+            try:
+                config.insert_json5("connect/endpoints", f'["{self._router_url}"]')
+            except Exception:
+                pass
+            # zenoh.open() is blocking; run in executor to avoid blocking the asyncio event loop
+            loop = asyncio.get_running_loop()
+            self._main_loop = loop
+            self._zenoh_session = await loop.run_in_executor(None, zenoh.open, config)
+            if self._debug:
+                logger.info("[Vitrus] Connected to Zenoh router at %s - agent/actor traffic will use Zenoh.", self._router_url)
+            self._ensure_zenoh_agent_response_subscriber()
+            return True
+        except Exception as e:
+            if self._debug:
+                logger.info(f"[Vitrus] Failed to establish Zenoh session: {e}")
+            self._zenoh_session = None
+            return False
+
+    def _ensure_zenoh_agent_response_subscriber(self) -> None:
+        if not self._zenoh_session or self._zenoh_agent_response_subscriber or not self._client_id:
+            return
+        agent_channel = self._get_agent_channel()
+        if not agent_channel:
+            return
+        main_loop = self._main_loop
+
+        def _on_sample(sample: Any) -> None:
+            message = self._parse_zenoh_sample(sample)
+            if not message or message.get("type") != "RESPONSE":
+                return
+            request_id = message.get("requestId")
+            fut = self._pending_requests.pop(request_id, None)
+            if not fut or fut.done():
+                return
+            err = message.get("error")
+            result = message.get("result")
+            # Zenoh invokes this from a worker thread; schedule result on main loop so the awaiting coroutine wakes immediately
+            if main_loop:
+                main_loop.call_soon_threadsafe(
+                    lambda: _resolve_response_future(fut, err, result)
+                )
+            else:
+                if err:
+                    fut.set_exception(RuntimeError(err))
+                else:
+                    fut.set_result(result)
+
+        def _resolve_response_future(f: asyncio.Future, err: Optional[str], result: Any) -> None:
+            if f.done():
+                return
+            if err:
+                f.set_exception(RuntimeError(err))
+            else:
+                f.set_result(result)
+
+        try:
+            self._zenoh_agent_response_subscriber = self._zenoh_session.declare_subscriber(
+                agent_channel, _on_sample
+            )
+            if self._debug:
+                logger.info("[Vitrus] Subscribed to agent response channel via Zenoh: %s", agent_channel)
+        except Exception as e:
+            if self._debug:
+                logger.info("[Vitrus] Failed to declare Zenoh agent response subscriber: %s", e)
+
+    async def _ensure_zenoh_actor_subscriber(self) -> None:
+        if not self._current_actor_name:
+            return
+        if not await self._ensure_zenoh_session():
+            return
+        if self._zenoh_actor_subscriber:
+            return
+        actor_key = self._get_actor_key(self._current_actor_name)
+
+        def _on_sample(sample: Any):
+            message = self._parse_zenoh_sample(sample)
+            if not message or message.get("type") != "COMMAND":
+                return
+            self._handle_command_message(message)
+
+        try:
+            self._zenoh_actor_subscriber = self._zenoh_session.declare_subscriber(actor_key, _on_sample)
+        except Exception as e:
+            if self._debug:
+                logger.info(f"[Vitrus] Failed to declare Zenoh subscriber: {e}")
+            self._zenoh_actor_subscriber = None
+
+    def _parse_zenoh_sample(self, sample: Any) -> Optional[Dict[str, Any]]:
+        payload = getattr(sample, "payload", sample)
+        if hasattr(payload, "to_string"):
+            text = payload.to_string()
+        elif isinstance(payload, (bytes, bytearray)):
+            text = payload.decode("utf-8", errors="ignore")
+        else:
+            text = str(payload)
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
+
+    def _publish_zenoh(self, key_expr: str, message: Dict[str, Any]) -> None:
+        if not self._zenoh_session:
+            return
+        self._zenoh_session.put(key_expr, json.dumps(message))
+
     def _handle_message(self, message: Dict[str, Any]):
         msg_type = message.get("type")
         
@@ -552,8 +843,16 @@ class Vitrus:
             auth_future = self._pending_requests.pop("HANDSHAKE_RESPONSE", None)
             if response.get("success"):
                 self._client_id = response.get("clientId", "")
-                self._redis_channel = response.get("redisChannel")
+                self._router_url = response.get("routerUrl") or self._router_url
+                self._server_ip = response.get("serverIp")
+                self._world_exists = response.get("worldExists")
+                if self._router_url and self._debug:
+                    logger.info("[Vitrus] Agent/actor communication: Zenoh (routerUrl=%s)", self._router_url)
+                elif not self._router_url and self._debug:
+                    logger.info("[Vitrus] Agent/actor communication: WebSocket only (no Zenoh routerUrl).")
                 if self._debug: logger.info(f"[Vitrus] Handshake successful. Client ID: {self._client_id}.")
+                if self._current_actor_name and self._router_url:
+                    asyncio.create_task(self._ensure_zenoh_actor_subscriber())
                 
                 actor_info = response.get("actorInfo")
                 if actor_info and self._current_actor_name:
@@ -566,6 +865,9 @@ class Vitrus:
                             self._actor_command_signatures[self._current_actor_name][cmd_def["name"]] = cmd_def["parameterTypes"]
                 
                 if auth_future and not auth_future.done(): auth_future.set_result(True)
+                # If we're an agent, sync event subscriptions to DAO over WebSocket so we receive broadcasts from WS actors
+                if not self._current_actor_name:
+                    asyncio.create_task(self._sync_agent_event_subscriptions_ws())
             else:
                 err_msg = response.get("message", "Handshake failed due to unknown server error.")
                 err_code = response.get("error_code", "UNKNOWN_ERROR")
@@ -576,9 +878,23 @@ class Vitrus:
         request_id = message.get("requestId")
         pending_future = self._pending_requests.get(request_id) if request_id else None
 
-        if msg_type == "COMMAND":
-            self._handle_command_message(message) # Changed to avoid direct TypedDict casting here
+        # Handle get actor info response (Supabase-backed actor record)
+        if msg_type == "GET_ACTOR_INFO_RESPONSE":
+            rid = message.get("requestId")
+            pending = self._pending_requests.get(rid) if rid else None
+            if pending:
+                self._pending_requests.pop(rid)
+                err = message.get("error")
+                if err:
+                    if not pending.done():
+                        pending.set_exception(RuntimeError(err))
+                else:
+                    actor_data = message.get("actor")
+                    if not pending.done():
+                        pending.set_result(actor_data)
             return
+
+        # COMMAND and RESPONSE come via Zenoh only; not handled on WebSocket.
 
         if msg_type in ["RESPONSE", "WORKFLOW_RESULT", "WORKFLOW_LIST"]:
             if pending_future:
@@ -599,13 +915,37 @@ class Vitrus:
                 logger.warning(f"Received message for unknown or already handled request ID: {request_id}, Type: {msg_type}")
             return
 
+        # COMMAND can come via WebSocket when DAO does not use Zenoh (routerUrl not set)
+        if msg_type == "COMMAND":
+            self._handle_command_message(message)
+            return
+
+        # ACTOR_BROADCAST / ACTOR_EVENT can come via WebSocket (DAO forwarding to agent) or Zenoh
+        if msg_type in ("ACTOR_BROADCAST", "ACTOR_EVENT"):
+            actor_name = message.get("actorName")
+            event_name = message.get("eventName") or message.get("broadcastName")
+            data = message.get("args", {})
+            if actor_name and event_name:
+                callbacks = self._actor_event_listeners.get(actor_name, {}).get(event_name, [])
+                for cb in callbacks:
+                    try:
+                        cb(data)
+                    except Exception as e:
+                        if self._debug:
+                            logger.info("[Vitrus] Actor event callback error: %s", e)
+            return
+
         handlers = self._message_handlers.get(msg_type, [])
         for handler_fn in handlers:
             try: handler_fn(message)
             except Exception as e: logger.error(f"Error in custom message handler for type {msg_type}: {e}")
 
     def _handle_command_message(self, command_msg_data: Dict[str,Any]):
-        actor_name = command_msg_data.get("targetActorName")
+        target_type = command_msg_data.get("targetType")
+        target_name = command_msg_data.get("targetName")
+        actor_name = target_name if target_type == "actor" else self._current_actor_name
+        if not actor_name:
+            actor_name = command_msg_data.get("targetActorName")
         command_name = command_msg_data.get("commandName")
         args = command_msg_data.get("args", [])
         request_id = command_msg_data.get("requestId")
@@ -615,13 +955,26 @@ class Vitrus:
             logger.error(f"Received malformed COMMAND message: {command_msg_data}")
             return
 
+        # Dedupe: Python agent sends to both Zenoh and DAO WebSocket; actor may receive same COMMAND twice
+        if request_id in self._processed_request_ids:
+            if self._debug: logger.debug(f"[Vitrus] Skipping duplicate COMMAND requestId={request_id}")
+            return
+        if len(self._processed_request_ids) >= self._max_processed_request_ids:
+            self._processed_request_ids.clear()
+        self._processed_request_ids.add(request_id)
+
         if self._debug: logger.info(f"[Vitrus] Handling command: '{command_name}' for actor '{actor_name}' with args: {args}")
 
         actor_handlers = self._actor_command_handlers.get(actor_name, {})
         handler = actor_handlers.get(command_name)
 
         async def execute_and_respond_task():
-            response_payload: Dict[str, Any] = {"type": "RESPONSE", "targetChannel": source_channel or "", "requestId": request_id}
+            response_payload: Dict[str, Any] = {
+                "type": "RESPONSE",
+                "targetChannel": source_channel or "",
+                "requestId": request_id,
+                "commandId": request_id
+            }
             if not handler:
                 logger.warning(f"No handler for command '{command_name}' on actor '{actor_name}'.")
                 response_payload["error"] = f"Command '{command_name}' not found on actor '{actor_name}'."
@@ -637,18 +990,133 @@ class Vitrus:
                     logger.error(f"Error executing command '{command_name}' on '{actor_name}': {type(e).__name__} - {e}", exc_info=self._debug)
                     response_payload["error"] = str(e)
             
-            try: # Ensure response is sent even if main connection drops during execution
-                 await self._send_message_public(response_payload) # type: ignore
+            try:  # Respond via same channel: Zenoh if command had sourceChannel (from Zenoh), else WebSocket (from DAO/TS agent)
+                if source_channel and self._router_url and await self._ensure_zenoh_session() and self._zenoh_session:
+                    reply_key = source_channel
+                    self._publish_zenoh(reply_key, response_payload)
+                else:
+                    await self._send_message_internal_ws(response_payload)
             except ConnectionError as ce:
-                 logger.error(f"ConnectionError sending response for {request_id}: {ce}")
+                logger.error(f"ConnectionError sending response for {request_id}: {ce}")
             except Exception as e:
-                 logger.error(f"Unexpected error sending response for {request_id}: {e}")
+                logger.error(f"Unexpected error sending response for {request_id}: {e}")
 
-        asyncio.create_task(execute_and_respond_task())
+        # Zenoh invokes this from a worker thread; schedule the coroutine on the main loop
+        if self._main_loop is not None:
+            asyncio.run_coroutine_threadsafe(execute_and_respond_task(), self._main_loop)
+        else:
+            asyncio.create_task(execute_and_respond_task())
 
 
     def _generate_request_id(self) -> str:
         return uuid.uuid4().hex[:13]
+
+    def _get_actor_key(self, actor_name: str) -> str:
+        if not self._world_id:
+            if self._debug:
+                logger.info("[Vitrus] No world_id set, using actor name for key.")
+            return f"dao/actor/{actor_name}"
+        return f"dao/{self._world_id}/actor/{actor_name}"
+
+    def _get_actor_event_key(self, actor_name: str, event_name: str) -> str:
+        if not self._world_id:
+            return f"dao/actor/{actor_name}/event/{event_name}"
+        return f"dao/{self._world_id}/actor/{actor_name}/event/{event_name}"
+
+    def _get_agent_channel(self) -> Optional[str]:
+        if not self._client_id:
+            return None
+        return f"dao/agent/{self._client_id}"
+
+    def _get_agent_sender_name(self) -> str:
+        return self._client_id or "agent"
+
+    async def broadcast_actor_event(self, actor_name: str, event_name: str, data: Any) -> None:
+        """Actor broadcasts an event to subscribed agents on both Zenoh and WebSocket when available."""
+        if not self._is_authenticated or self._current_actor_name != actor_name:
+            raise RuntimeError("Must be authenticated as this actor to broadcast")
+        payload = {"type": "ACTOR_BROADCAST", "actorName": actor_name, "eventName": event_name, "args": data if data is not None else {}, "worldId": self._world_id}
+        # Send via Zenoh when router is configured
+        if self._router_url and await self._ensure_zenoh_session() and self._zenoh_session:
+            self._zenoh_session.put(self._get_actor_event_key(actor_name, event_name), json.dumps(payload))
+            if self._debug:
+                logger.info("[Vitrus] Broadcast via Zenoh (event=%s)", event_name)
+        # Also send via WebSocket so DAO can forward to WS-connected agents
+        if self._ws_is_open():
+            await self._send_message_internal_ws(payload)
+            if self._debug:
+                logger.info("[Vitrus] Broadcast via WebSocket (event=%s)", event_name)
+
+    def subscribe_actor_event(self, actor_name: str, event_name: str, callback: Callable[[Any], None]) -> None:
+        """Agent subscribes to an actor's event (Zenoh and/or WebSocket). Registers callback and notifies DAO over WS when agent."""
+        if actor_name not in self._actor_event_listeners:
+            self._actor_event_listeners[actor_name] = {}
+        if event_name not in self._actor_event_listeners[actor_name]:
+            self._actor_event_listeners[actor_name][event_name] = []
+        self._actor_event_listeners[actor_name][event_name].append(callback)
+
+        async def _ensure_zenoh_event_sub() -> None:
+            if await self._ensure_zenoh_session():
+                self._ensure_zenoh_event_subscriber(actor_name, event_name)
+
+        asyncio.create_task(_ensure_zenoh_event_sub())
+
+        # Register with DAO over WebSocket so we receive broadcasts from WS actors (and Zenoh actors forwarded by DAO)
+        async def _send_subscribe_ws() -> None:
+            if self._is_authenticated and self._ws_is_open() and not self._current_actor_name:
+                try:
+                    await self._send_message_internal_ws({"type": "SUBSCRIBE_ACTOR_EVENT", "actorName": actor_name, "eventName": event_name})
+                    if self._debug:
+                        logger.info("[Vitrus] SUBSCRIBE_ACTOR_EVENT sent over WebSocket: %s / %s", actor_name, event_name)
+                except Exception as e:
+                    if self._debug:
+                        logger.info("[Vitrus] Failed to send SUBSCRIBE_ACTOR_EVENT over WS: %s", e)
+
+        asyncio.create_task(_send_subscribe_ws())
+
+    async def _sync_agent_event_subscriptions_ws(self) -> None:
+        """Send SUBSCRIBE_ACTOR_EVENT for all registered event listeners so DAO forwards broadcasts to this agent."""
+        if not self._is_authenticated or not self._ws_is_open() or self._current_actor_name:
+            return
+        for actor_name, events in self._actor_event_listeners.items():
+            for event_name in events:
+                try:
+                    await self._send_message_internal_ws({"type": "SUBSCRIBE_ACTOR_EVENT", "actorName": actor_name, "eventName": event_name})
+                    if self._debug:
+                        logger.info("[Vitrus] SUBSCRIBE_ACTOR_EVENT (sync) over WebSocket: %s / %s", actor_name, event_name)
+                except Exception as e:
+                    if self._debug:
+                        logger.info("[Vitrus] Failed to sync SUBSCRIBE_ACTOR_EVENT over WS: %s", e)
+
+    def _ensure_zenoh_event_subscriber(self, actor_name: str, event_name: str) -> None:
+        if not self._zenoh_session:
+            return
+        key = f"{actor_name}:{event_name}"
+        if key in self._zenoh_event_subscribers:
+            return
+        event_key = self._get_actor_event_key(actor_name, event_name)
+
+        def _on_sample(sample: Any) -> None:
+            message = self._parse_zenoh_sample(sample)
+            if not message or message.get("type") not in ("ACTOR_BROADCAST", "ACTOR_EVENT"):
+                return
+            data = message.get("args", {})
+            callbacks = self._actor_event_listeners.get(actor_name, {}).get(event_name, [])
+            for cb in callbacks:
+                try:
+                    cb(data)
+                except Exception as e:
+                    if self._debug:
+                        logger.info("[Vitrus] Actor event callback error: %s", e)
+
+        try:
+            sub = self._zenoh_session.declare_subscriber(event_key, _on_sample)
+            self._zenoh_event_subscribers[key] = sub
+            if self._debug:
+                logger.info("[Vitrus] Subscribed to actor event via Zenoh: %s", event_key)
+        except Exception as e:
+            if self._debug:
+                logger.info("[Vitrus] Failed to declare Zenoh event subscriber: %s", e)
 
     async def authenticate(self, actor_name: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> bool:
         if self._debug: logger.info(f"[Vitrus] Authenticating..." + (f" (as actor: {actor_name})" if actor_name else " (as agent)"))
@@ -704,6 +1172,12 @@ class Vitrus:
         message: RegisterCommandMessage = {"type": "REGISTER_COMMAND", "actorName": actor_name, "commandName": command_name, "parameterTypes": parameter_types}
         await self._send_message_public(message)
 
+    def _get_registered_commands(self, actor_name: Optional[str]) -> Optional[List[Dict[str, Any]]]:
+        if not actor_name:
+            return None
+        signatures = self._actor_command_signatures.get(actor_name, {})
+        return [{"name": name, "parameterTypes": parameter_types} for name, parameter_types in signatures.items()]
+
 
     async def _register_pending_commands(self, actor_name: str):
         if not self._is_authenticated or self._current_actor_name != actor_name: return
@@ -721,6 +1195,32 @@ class Vitrus:
                 except Exception as e: logger.error(f"Error registering pending command {cmd_name} for actor {actor_name}: {e}")
 
 
+    async def get_actor_info(self, actor_name: str) -> Optional[ActorRecord]:
+        """Fetch Supabase-backed actor record (id, info, device_id, state, registeredCommands)."""
+        if not self._world_id:
+            raise ValueError("Vitrus SDK requires a world_id to get actor info.")
+        if not self._is_authenticated:
+            await self.authenticate()
+        request_id = self._generate_request_id()
+        msg: GetActorInfoMessage = {
+            "type": "GET_ACTOR_INFO",
+            "worldId": self._world_id,
+            "actorName": actor_name,
+            "requestId": request_id,
+        }
+        fut: asyncio.Future[Optional[ActorRecord]] = asyncio.Future()
+        self._pending_requests[request_id] = fut
+        try:
+            await self._send_message_public(msg)
+            return await asyncio.wait_for(fut, timeout=10.0)
+        except asyncio.TimeoutError:
+            self._pending_requests.pop(request_id, None)
+            logger.warning(f"Timeout waiting for GET_ACTOR_INFO for '{actor_name}' (req ID: {request_id})")
+            return None
+        except Exception:
+            self._pending_requests.pop(request_id, None)
+            raise
+
     async def actor(self, name: str, options: Optional[Dict[str, Any]] = None) -> Actor:
         if self._debug: logger.info(f"[Vitrus] actor(name='{name}', options={'provided' if options is not None else 'not provided'})")
 
@@ -729,8 +1229,13 @@ class Vitrus:
 
         current_meta = self._actor_metadata.get(name, {})
         if options is not None: current_meta.update(options); self._actor_metadata[name] = current_meta
-        
-        actor_instance = Actor(self, name, current_meta)
+
+        record: Optional[ActorRecord] = None
+        if options is None and self._world_id:
+            record = await self.get_actor_info(name)
+            # Agent: ensure Zenoh session and response subscriber are ready before first run_command
+            await self._ensure_zenoh_session()
+        actor_instance = Actor(self, name, current_meta, record=record)
 
         if options is not None: # Intent to BE this actor
             # Authenticate if not already this actor, or if metadata changed implying re-auth might be needed
@@ -751,21 +1256,42 @@ class Vitrus:
     async def run_command(self, actor_name: str, command_name: str, args: List[Any]) -> Any:
         if self._debug: logger.info(f"[Vitrus] run_command: actor='{actor_name}', command='{command_name}', args={args}")
         if not self._world_id: raise ValueError("Vitrus SDK requires a world_id to run commands on actors.")
-        if not self._is_authenticated: await self.authenticate() # Authenticate as agent
+        if not self._is_authenticated: await self.authenticate()  # Authenticate as agent
 
         request_id = self._generate_request_id()
-        command_msg: CommandMessage = {"type": "COMMAND", "targetActorName": actor_name, "commandName": command_name, "args": args, "requestId": request_id}
+        command_msg: CommandMessage = {
+            "type": "COMMAND",
+            "senderType": "agent",
+            "senderName": self._get_agent_sender_name(),
+            "targetType": "actor",
+            "targetName": actor_name,
+            "commandName": command_name,
+            "args": args,
+            "requestId": request_id,
+            "sourceChannel": self._get_agent_channel(),
+            "worldId": self._world_id
+        }
 
         fut = asyncio.Future()
         self._pending_requests[request_id] = fut
         try:
-            await self._send_message_public(command_msg)
+            # Send via Zenoh so Python actors receive (when routerUrl is set)
+            if self._router_url:
+                await self._ensure_zenoh_session()
+                if self._zenoh_session:
+                    actor_key = self._get_actor_key(actor_name)
+                    self._publish_zenoh(actor_key, command_msg)
+                    if self._debug: logger.info("[Vitrus] Command sent via Zenoh (actor=%s)", actor_name)
+            # Always send via DAO WebSocket so TypeScript actors receive (DAO forwards to WS actors)
+            if self._ws_is_open():
+                await self._send_message_internal_ws(command_msg)
+                if self._debug: logger.info("[Vitrus] Command sent via DAO WebSocket (actor=%s)", actor_name)
             return await asyncio.wait_for(fut, timeout=30.0)
         except asyncio.TimeoutError:
             self._pending_requests.pop(request_id, None)
             logger.error(f"Timeout waiting for response to command '{command_name}' on actor '{actor_name}' (req ID: {request_id})")
             raise TimeoutError(f"Timeout for command '{command_name}' on '{actor_name}'")
-        except Exception as e: # Includes ConnectionError from _send_message_public if auth fails
+        except Exception:
             self._pending_requests.pop(request_id, None)
             raise
 
@@ -781,7 +1307,7 @@ class Vitrus:
                 await self.authenticate()  # Authenticate as agent only if no actor context
 
         request_id = self._generate_request_id()
-        workflow_msg: WorkflowMessage = {"type": "WORKFLOW", "workflowName": workflow_name, "args": args if args is not None else {}, "requestId": request_id}
+        workflow_msg: WorkflowInvocationMessage = {"type": "WORKFLOW_INVOCATION", "workflowName": workflow_name, "args": args if args is not None else {}, "requestId": request_id}
 
         fut = asyncio.Future()
         self._pending_requests[request_id] = fut
