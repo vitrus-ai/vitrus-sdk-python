@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vitrus"
-version = "0.1.0" # Keep in sync with your setup.py or single-source it later
+version = "0.2.0" # Keep in sync with your setup.py or single-source it later
 authors = [
     { name="Vitrus AI", email="support@vitrus.ai" },
 ]
@@ -31,7 +31,7 @@ classifiers = [
 ]
 dependencies = [
     "websockets>=10.0",
-    "zenoh",
+    "eclipse-zenoh @ git+https://github.com/eclipse-zenoh/zenoh-python.git",
     # asyncio is part of the standard library, no need to list it here
 ]
 
