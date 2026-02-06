@@ -31,7 +31,7 @@ classifiers = [
 ]
 dependencies = [
     "websockets>=10.0",
-    "eclipse-zenoh @ git+https://github.com/eclipse-zenoh/zenoh-python.git",
+    "eclipse-zenoh>=1.7.2",
     # asyncio is part of the standard library, no need to list it here
 ]
 
